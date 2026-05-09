@@ -15,7 +15,9 @@ from cracked.tiles import (
 )
 from cracked.hand import HandState, Meld, MeldType
 from cracked.game_state import GameState, PlayerView, save_state, load_state
-from cracked.shanten import shanten, best_discards
+from cracked.shanten import shanten
+from cracked.optimizer import recommend_discard, adaptive_alpha
+from cracked.opponent_model import model_all_opponents
 
 console = Console()
 
@@ -263,7 +265,16 @@ def record_flower(tile: str, by: str):
 # ---------------------------------------------------------------------------
 
 @cli.command("recommend")
-def recommend():
+@click.option("--deep", is_flag=True, default=False,
+              help="Run Monte Carlo simulations for more accurate estimates")
+@click.option("--games", default=200, show_default=True,
+              help="Number of simulations per discard (used with --deep)")
+@click.option("--log", "log_file", default=None, show_default=True,
+              help="JSONL file to append simulation results for ML training "
+                   "(used with --deep, default: data/game_log.jsonl)")
+@click.option("--model", "model_path", default=None,
+              help="Path to a trained DangerNet .pt model for prediction")
+def recommend(deep: bool, games: int, log_file: str | None, model_path: str | None):
     """Show discard recommendations for your current 14-tile hand."""
     state = load_state()
     hand = state.my_hand
@@ -277,60 +288,180 @@ def recommend():
         )
         return
 
-    current_s = shanten(hand.concealed, len(hand.melds))
-    unknown = state.unknown_tiles()
-    results = best_discards(hand.concealed, unknown, len(hand.melds))
-
+    results = recommend_discard(state)
     if not results:
         console.print("[red]No valid discards found.[/red]")
         return
 
+    models = model_all_opponents(state)
+    current_s = shanten(hand.concealed, len(hand.melds))
+    alpha = adaptive_alpha(state, models, results[0].shanten_after)
+
     table = Table(
-        title=f"Discard Recommendations  (current shanten: {current_s})",
+        title=(
+            f"Discard Recommendations  "
+            f"(shanten: {current_s}  |  α={alpha:.2f}  |  "
+            f"wall: {state.wall_tiles_remaining})"
+        ),
         box=box.ROUNDED, show_lines=False,
     )
     table.add_column("#", style="dim", width=3)
     table.add_column("Discard", width=7)
     table.add_column("Shanten", justify="center", width=8)
     table.add_column("Tiles in", justify="center", width=8)
-    table.add_column("Accepts", width=45)
+    table.add_column("Danger", justify="center", width=7)
+    table.add_column("Cost", justify="center", width=6)
+    table.add_column("Accepts", width=38)
 
     for i, r in enumerate(results[:8], 1):
-        tid = r["tile_id"]
-        s_after = r["shanten_after"]
-        acc = r["acceptance"]
-        weighted = r["weighted_acceptance"]
+        accept_tiles = sorted(r.acceptance.keys())
+        accept_str = " ".join(_rt(t) for t in accept_tiles[:10])
+        if len(accept_tiles) > 10:
+            accept_str += f" [dim]+{len(accept_tiles)-10}[/dim]"
 
-        accept_tiles = sorted(acc.keys())
-        accept_str = " ".join(_rt(t) for t in accept_tiles[:12])
-        if len(accept_tiles) > 12:
-            accept_str += f" [dim]+{len(accept_tiles)-12}[/dim]"
-
-        s_color = "green" if s_after <= 0 else ("yellow" if s_after == 1 else "white")
+        s_color = "green" if r.shanten_after <= 0 else ("yellow" if r.shanten_after == 1 else "white")
+        d_color = "red" if r.danger_score > 0.3 else ("yellow" if r.danger_score > 0.1 else "green")
         table.add_row(
             str(i),
-            _rt(tid),
-            f"[{s_color}]{s_after}[/{s_color}]",
-            str(weighted),
+            _rt(r.tile_id),
+            f"[{s_color}]{r.shanten_after}[/{s_color}]",
+            str(r.weighted_acceptance),
+            f"[{d_color}]{r.danger_score:.2f}[/{d_color}]",
+            f"{r.shooting_cost:.1f}",
             accept_str,
         )
 
     console.print(table)
 
     best = results[0]
-    if best["shanten_after"] == -1:
-        console.print(f"[bold green]Complete hand![/bold green] Discard {_rt(best['tile_id'])} to win.")
-    elif best["shanten_after"] == 0:
+    if best.shanten_after == -1:
+        console.print(f"[bold green]Complete hand![/bold green] Discard {_rt(best.tile_id)} to win.")
+    elif best.shanten_after == 0:
         console.print(
             f"[bold green]Tenpai![/bold green] "
-            f"Best discard: {_rt(best['tile_id'])}  |  "
-            f"{best['weighted_acceptance']} acceptance tiles"
+            f"Best discard: {_rt(best.tile_id)}  |  "
+            f"{best.weighted_acceptance} acceptance tiles  |  "
+            f"Danger: {best.danger_score:.2f}"
         )
     else:
         console.print(
-            f"Best discard: {_rt(best['tile_id'])}  →  "
-            f"shanten {best['shanten_after']} with {best['weighted_acceptance']} acceptance tiles"
+            f"Best discard: {_rt(best.tile_id)}  →  "
+            f"shanten {best.shanten_after}  |  "
+            f"{best.weighted_acceptance} acceptance tiles  |  "
+            f"Danger: {best.danger_score:.2f}"
         )
+
+    if model_path is not None:
+        _show_model_predictions(state, results, model_path)
+
+    if not deep:
+        return
+
+    # ------------------------------------------------------------------
+    # Deep mode: Monte Carlo simulation
+    # ------------------------------------------------------------------
+    from cracked.simulator import run_simulation
+
+    console.print()
+    console.print(f"[dim]Running {games} simulations per discard…[/dim]")
+    sim_results = run_simulation(state, n_games=games)
+
+    sim_by_tile = {sr.tile_id: sr for sr in sim_results}
+
+    sim_table = Table(
+        title=f"Simulation Results  ({games} games each)",
+        box=box.ROUNDED, show_lines=False,
+    )
+    sim_table.add_column("#", style="dim", width=3)
+    sim_table.add_column("Discard", width=7)
+    sim_table.add_column("Win%", justify="center", width=7)
+    sim_table.add_column("Shoot%", justify="center", width=8)
+    sim_table.add_column("E[Gain]", justify="center", width=8)
+
+    for i, r in enumerate(results[:8], 1):
+        sr = sim_by_tile.get(r.tile_id)
+        if sr is None:
+            continue
+        gain = sr.expected_gain
+        gain_color = "green" if gain > 0 else ("red" if gain < -0.5 else "yellow")
+        sim_table.add_row(
+            str(i),
+            _rt(r.tile_id),
+            f"{sr.win_rate * 100:.1f}%",
+            f"{sr.shoot_rate * 100:.1f}%",
+            f"[{gain_color}]{gain:+.2f}[/{gain_color}]",
+        )
+
+    console.print(sim_table)
+
+    # Log simulation results for ML training
+    _log_sim_results(state, sim_results, log_file)
+
+
+def _log_sim_results(state, sim_results, log_file_str):
+    """Append simulation results to the training log file."""
+    from pathlib import Path
+    from cracked.training.data import record_simulation, DEFAULT_LOG_FILE
+    log_path = Path(log_file_str) if log_file_str else DEFAULT_LOG_FILE
+    try:
+        for sr in sim_results:
+            record_simulation(state, sr, log_file=log_path)
+        console.print(f"[dim]Logged {len(sim_results)} examples → {log_path}[/dim]")
+    except Exception as exc:
+        console.print(f"[yellow]Warning: could not log training data: {exc}[/yellow]")
+
+
+def _show_model_predictions(state, heuristic_results, model_path_str):
+    """Show DangerNet predictions alongside the heuristic table."""
+    import numpy as np
+    from pathlib import Path
+
+    try:
+        import torch
+        from cracked.training.model import load_model
+        from cracked.training.features import extract_features
+    except ImportError:
+        console.print("[yellow]--model requires PyTorch: pip install 'cracked[ml]'[/yellow]")
+        return
+
+    path = Path(model_path_str)
+    if not path.exists():
+        console.print(f"[red]Model not found: {path}[/red]")
+        return
+
+    model = load_model(path)
+
+    rows = []
+    for r in heuristic_results[:8]:
+        feat = extract_features(state, r.tile_id)
+        with torch.no_grad():
+            pred = model(torch.tensor(feat).unsqueeze(0)).squeeze(0).numpy()
+        rows.append((r.tile_id, float(pred[0]), float(pred[1]), float(pred[2])))
+
+    rows.sort(key=lambda x: -x[3])  # sort by predicted expected_gain
+
+    model_table = Table(
+        title=f"DangerNet Predictions  ({path.name})",
+        box=box.ROUNDED, show_lines=False,
+    )
+    model_table.add_column("#", style="dim", width=3)
+    model_table.add_column("Discard", width=7)
+    model_table.add_column("Win%", justify="center", width=7)
+    model_table.add_column("Shoot%", justify="center", width=8)
+    model_table.add_column("E[Gain]", justify="center", width=8)
+
+    for i, (tid, win_r, shoot_r, gain) in enumerate(rows, 1):
+        gain_color = "green" if gain > 0 else ("red" if gain < -0.5 else "yellow")
+        model_table.add_row(
+            str(i),
+            _rt(tid),
+            f"{win_r * 100:.1f}%",
+            f"{shoot_r * 100:.1f}%",
+            f"[{gain_color}]{gain:+.2f}[/{gain_color}]",
+        )
+
+    console.print()
+    console.print(model_table)
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,9 @@ dependencies = [
 ml = [
     "torch>=2.1",
 ]
+ui = [
+    "textual>=0.50",
+]
 dev = [
     "pytest>=7.4",
     "pytest-cov>=4.1",
@@ -24,9 +27,13 @@ dev = [
 
 [project.scripts]
 cracked = "cracked.cli:cli"
+cracked-ui = "cracked.tui:main"
+cracked-play = "cracked.tui_game:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["slow: full game simulations (run with -m slow)"]
+addopts = "-m 'not slow'"

@@ -5,10 +5,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Install in editable mode with dev dependencies
+# Install (core + dev)
 pip install -e ".[dev]"
 
-# Run all tests
+# Install with PyTorch for ML training
+pip install -e ".[dev,ml]"
+
+# Install with Textual TUI
+pip install -e ".[dev,ui]"
+
+# Run all fast tests (slow simulation tests excluded by default)
 python -m pytest tests/ -v
 
 # Run a single test file
@@ -17,17 +23,28 @@ python -m pytest tests/test_shanten.py -v
 # Run a specific test
 python -m pytest tests/test_shanten.py::test_tenpai_single_wait -v
 
-# Start a game session
+# Run slow tests (full game simulations)
+python -m pytest -m slow -v
+
+# Play a game session
 cracked new-game --seat east --prevailing east
 cracked hand b1 b2 b3 c1 c2 c3 d1 d2 d3 ew ew ew rd
-cracked draw rd
-cracked recommend
+cracked draw gd
+cracked recommend              # heuristic
+cracked recommend --deep --games 200  # Monte Carlo (logs to data/game_log.jsonl)
+cracked recommend --model models/danger_net.pt  # trained model
 cracked status
+
+# Train DangerNet (supervised) after accumulating --deep data
+python -m cracked.training.trainer --log data/game_log.jsonl --out models/danger_net.pt
+
+# Train ActorCritic (self-play RL)
+python -m cracked.training.self_play --episodes 5000 --out models/policy.pt
 ```
 
 ## Architecture
 
-This is a Singaporean Mahjong discard optimizer built in phases. The core is a heuristic engine (phases 1–5) that will be augmented by Monte Carlo simulation (phase 6) and ML training (phases 7–8).
+All 8 phases are complete. The stack is: heuristic engine (phases 1–5) → Monte Carlo simulator (phase 6) → supervised DangerNet (phase 7) → self-play RL ActorCritic (phase 8).
 
 ### Tile Encoding (`src/cracked/tiles.py`)
 
@@ -111,8 +128,12 @@ Built with Click + Rich. All commands load/save state from the JSON file.
 | `cracked discard TILE [--by SEAT]` | Record a discard (yours or opponent's) |
 | `cracked meld TYPE TILES... --by SEAT [--concealed]` | Record a pong/kong/chow |
 | `cracked flower TILE [--by SEAT]` | Record a bonus tile reveal |
-| `cracked recommend` | Show discard recommendations for a 14-tile hand |
+| `cracked recommend [--deep] [--games N] [--log FILE] [--model PATH]` | Discard recommendations |
 | `cracked status` | Display the full game state |
+| `cracked-ui` | Textual TUI advisor mode (requires `.[ui]`) |
+| `cracked-play` | Textual TUI simulated game viewer (requires `.[ui]`) |
+
+`recommend` flags: `--deep` runs Monte Carlo simulation and logs results; `--model PATH` shows DangerNet predictions (requires torch).
 
 Tile colors in terminal output: bamboo=green, characters=red, circles=cyan, winds=yellow, dragons=magenta.
 
@@ -121,8 +142,10 @@ CLI tests use Click's `CliRunner` with `monkeypatch` to isolate state files — 
 ### Module Dependency Order
 
 ```
-tiles → hand → shanten → scoring → game_state → cli
-                                 ↘ (future: danger → optimizer)
+tiles → hand → shanten → scoring → game_state → danger → opponent_model → optimizer → cli
+                                                                        ↘ simulator ↗
+                                              training/features → training/model → training/trainer
+                                              training/features → training/self_play
 ```
 
 ### Singapore Mahjong Specifics
