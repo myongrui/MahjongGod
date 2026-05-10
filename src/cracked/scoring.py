@@ -29,9 +29,9 @@ from cracked.hand import HandState, Meld, MeldType
 @dataclass
 class HouseRules:
     tai_cap: int = 5
-    min_tai: int = 3
+    min_tai: int = 1 
     seven_pairs_base: int = 3       # some houses use 2
-    flowers_above_cap: bool = True  # flower/season tai added after cap is applied
+    flowers_above_cap: bool = False  # flower/season tai added after cap is applied
 
 
 DEFAULT_RULES = HouseRules()

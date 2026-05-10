@@ -129,6 +129,7 @@ class CrackedMahjongApp(App):
                 with Horizontal(id="btn-row"):
                     yield Button("Recommend", id="btn-recommend", variant="primary")
                     yield Button("Simulate", id="btn-simulate")
+                    yield Button("Quit", id="btn-quit", variant="error")
 
                 yield Label("Press R to recommend, S to simulate", id="status")
 
@@ -144,7 +145,7 @@ class CrackedMahjongApp(App):
 
     def on_mount(self) -> None:
         rec = self.query_one("#rec-table", DataTable)
-        rec.add_columns("#", "Discard", "Shanten", "Accepts", "Danger", "Cost", "Utility")
+        rec.add_columns("#", "Discard", "Tiles away", "Accepts", "Danger", "Cost", "Utility")
         rec.cursor_type = "none"
 
         sim = self.query_one("#sim-table", DataTable)
@@ -160,6 +161,8 @@ class CrackedMahjongApp(App):
             self.action_recommend()
         elif event.button.id == "btn-simulate":
             self.action_simulate()
+        elif event.button.id == "btn-quit":
+            self.exit()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -222,7 +225,7 @@ class CrackedMahjongApp(App):
         s = shanten(state.my_hand.concealed, 0)
         tiles_flat = [t for t in range(NTILES) for _ in range(int(state.my_hand.concealed[t]))]
         hand_str = " ".join(tile_name(t) for t in tiles_flat)
-        self.query_one("#hand-display", Label).update(f"{hand_str}  |  Shanten: {s}")
+        self.query_one("#hand-display", Label).update(f"{hand_str}  |  Tiles away: {s}")
 
         try:
             recs = recommend_discard(state)
@@ -242,7 +245,7 @@ class CrackedMahjongApp(App):
             if r.shanten_after == -1:
                 shanten_str = "win!"
             elif r.shanten_after == 0:
-                shanten_str = "tenpai"
+                shanten_str = "waiting"
             else:
                 shanten_str = str(r.shanten_after)
 
@@ -262,13 +265,13 @@ class CrackedMahjongApp(App):
                 self._set_status(f"Win! Discard {tile_name(best.tile_id)}")
             elif best.shanten_after == 0:
                 self._set_status(
-                    f"Tenpai! Best: {tile_name(best.tile_id)} — "
+                    f"Waiting! Best: {tile_name(best.tile_id)} — "
                     f"{best.weighted_acceptance} acceptance tiles"
                 )
             else:
                 self._set_status(
                     f"Best: {tile_name(best.tile_id)} → "
-                    f"shanten {best.shanten_after}, {best.weighted_acceptance} accepts"
+                    f"tiles away {best.shanten_after}, {best.weighted_acceptance} accepts"
                 )
 
     def action_simulate(self) -> None:

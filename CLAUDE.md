@@ -131,7 +131,7 @@ Built with Click + Rich. All commands load/save state from the JSON file.
 | `cracked recommend [--deep] [--games N] [--log FILE] [--model PATH]` | Discard recommendations |
 | `cracked status` | Display the full game state |
 | `cracked-ui` | Textual TUI advisor mode (requires `.[ui]`) |
-| `cracked-play` | Textual TUI simulated game viewer (requires `.[ui]`) |
+| `cracked-play` | Textual TUI game viewer — spectator or interactive (requires `.[ui]`) |
 
 `recommend` flags: `--deep` runs Monte Carlo simulation and logs results; `--model PATH` shows DangerNet predictions (requires torch).
 
@@ -139,11 +139,37 @@ Tile colors in terminal output: bamboo=green, characters=red, circles=cyan, wind
 
 CLI tests use Click's `CliRunner` with `monkeypatch` to isolate state files — never use ad-hoc shell commands to test CLI behavior.
 
+### Game Engine (`src/cracked/engine.py`)
+
+`GameEngine` is a synchronous turn-by-turn state machine that owns all 4 hands, the wall, and discard piles. It drives both TUI modes.
+
+**Wall**: 148 tiles — 136 standard (4 copies each of 34 types) + 12 bonus tiles (flowers 34-37, seasons 38-41, animals 42-45). Bonus tiles drawn during play are set aside with a replacement drawn automatically.
+
+**Event types** emitted by `deal()`, `step()`, and `submit_discard()`:
+
+| EventType | When |
+|---|---|
+| `DEAL` | Game starts — wall shuffled, 13 tiles dealt |
+| `DRAW` | A standard tile drawn from the wall |
+| `BONUS` | A bonus tile set aside; replacement follows |
+| `DISCARD` | A tile discarded |
+| `MELD` | A pong/kong/chow claimed from a discard |
+| `WIN_SELF_DRAW` | Player completes hand on their own draw |
+| `WIN_DISCARD` | Player completes hand on an opponent's discard |
+| `WALL_EXHAUSTED` | Wall empty — draw game |
+| `AWAIT_DISCARD` | Human player's turn — call `submit_discard()` |
+
+**Claim priority**: Ron (any discard completes hand) > Pong/Kong (clockwise) > Chow (left player only). Human players skip claim opportunities (no claim UI yet).
+
+**AI claim heuristics**: `_ai_wants_pong()` accepts if best post-pong discard maintains or improves shanten; `_ai_wants_kong()` allows up to shanten+1 (replacement compensates); `_pick_best_chow()` requires strict shanten improvement.
+
 ### Module Dependency Order
 
 ```
 tiles → hand → shanten → scoring → game_state → danger → opponent_model → optimizer → cli
                                                                         ↘ simulator ↗
+                                                          optimizer + simulator → engine → tui_game
+                                                                        optimizer → tui
                                               training/features → training/model → training/trainer
                                               training/features → training/self_play
 ```

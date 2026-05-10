@@ -13,8 +13,10 @@ from textual.widgets import (
 from textual import work
 from textual.timer import Timer
 
-from cracked.tiles import tile_name, NTILES, Wind
+from cracked.tiles import tile_name, NTILES, Wind, bonus_tile_name, is_animal
 from cracked.engine import GameEngine, EventType, GameEvent
+from cracked.shanten import shanten
+from cracked.scoring import calculate_tai, WinContext, DEFAULT_RULES
 
 # ---------------------------------------------------------------------------
 # Tile rendering helpers
@@ -58,17 +60,20 @@ def _gl(tid: int, bold: bool = False) -> str:
 
 
 def _hand_markup(tiles: list[int], drawn_tid: Optional[int] = None) -> str:
-    """Two-line Rich markup: glyph row + label row.  Drawn tile is bold."""
+    """Two-line markup: glyph row then label row directly below.
+    Glyph sep is 1 wider than label sep so each tile slot has equal display width
+    (glyphs render as 1-wide text chars; labels are 2 chars → slot = glyph+4 = label+3 = 5).
+    """
     seen_drawn = False
-    glyph_row: list[str] = []
-    label_row: list[str] = []
+    glyph_parts: list[str] = []
+    label_parts: list[str] = []
     for tid in tiles:
         highlight = (not seen_drawn) and (tid == drawn_tid)
         if highlight:
             seen_drawn = True
-        glyph_row.append(_g(tid, bold=highlight))
-        label_row.append(_gl(tid, bold=highlight))
-    return " ".join(glyph_row) + "\n" + " ".join(label_row)
+        glyph_parts.append(_g(tid, bold=highlight))
+        label_parts.append(_gl(tid, bold=highlight))
+    return "    ".join(glyph_parts) + "\n" + "   ".join(label_parts)
 
 
 def _discards_markup(discards: list[int]) -> str:
@@ -76,7 +81,77 @@ def _discards_markup(discards: list[int]) -> str:
     return " ".join(_g(t) for t in discards[-24:])
 
 
+def _meld_markup(meld) -> str:
+    """Render one exposed meld as a compact Rich markup group."""
+    tiles_str = " ".join(f"{_g(t)} {_gl(t)}" for t in meld.tiles)
+    if meld.type.value == "chow":
+        label = "Chow"
+    elif meld.type.value == "pong":
+        label = "Pong"
+    else:
+        label = "Kong (hidden)" if meld.concealed else "Kong"
+    return f"[bold]({label}:[/bold] {tiles_str}[bold])[/bold]"
+
+
+def _bonus_tiles_markup(flowers: list[int], animals: list[int]) -> str:
+    """Render bonus tiles (flowers/seasons green, animals yellow)."""
+    parts: list[str] = []
+    for bid in flowers:
+        parts.append(f"[green]{bonus_tile_name(bid)}[/green]")
+    for bid in animals:
+        parts.append(f"[yellow]{bonus_tile_name(bid)}[/yellow]")
+    return "  ".join(parts)
+
+
+def _exposed_row(hand) -> str:
+    """Single-line summary of a hand's exposed melds and bonus tiles."""
+    meld_parts = [_meld_markup(m) for m in hand.melds]
+    bonus_str = _bonus_tiles_markup(hand.flowers, hand.animals)
+    sections: list[str] = []
+    if meld_parts:
+        sections.append("  ┃  ".join(meld_parts))
+    if bonus_str:
+        sections.append(f"[dim]Bonus:[/dim] {bonus_str}")
+    return "   ".join(sections)
+
+
 SEAT_NAMES = {27: "East", 28: "South", 29: "West", 30: "North"}
+
+
+def _win_tai_str(engine: GameEngine, seat: int, tile: int, self_draw: bool) -> str:
+    """Score a completed hand and return a short display string e.g. '4 tai ✓'."""
+    hand = engine.players[seat].hand.copy()
+    if not self_draw:
+        hand.concealed[tile] += 1
+    ctx = WinContext(winning_tile=tile, is_self_draw=self_draw,
+                     prevailing_wind=engine.prevailing_wind)
+    try:
+        r = calculate_tai(hand, ctx, DEFAULT_RULES)
+        suffix = " ✓" if r.is_valid_win() else " (below min)"
+        return f"{r.total} tai{suffix}"
+    except Exception:
+        return "? tai"
+
+
+def _waiting_tai_label(hand, prevailing_wind: int) -> str:
+    """Return 'Waiting [X–Y tai]' (or 'Waiting [N tai]') for a 13-tile waiting hand."""
+    tai_values: list[int] = []
+    for wt in range(NTILES):
+        test = hand.concealed.copy()
+        test[wt] += 1
+        if shanten(test, len(hand.melds)) == -1:
+            h = hand.copy()
+            h.concealed[wt] += 1
+            ctx = WinContext(winning_tile=wt, prevailing_wind=prevailing_wind)
+            try:
+                tai_values.append(calculate_tai(h, ctx, DEFAULT_RULES).total)
+            except Exception:
+                pass
+    if not tai_values:
+        return "Waiting"
+    lo, hi = min(tai_values), max(tai_values)
+    return f"Waiting [{lo}–{hi} tai]" if lo != hi else f"Waiting [{lo} tai]"
+
 
 # ---------------------------------------------------------------------------
 # Mode selection screen
@@ -124,6 +199,7 @@ class ModeSelectScreen(Screen):
         with Horizontal(id="btn-box"):
             yield Button("Spectator Mode", id="btn-spectator", variant="primary")
             yield Button("Interactive Mode", id="btn-interactive", variant="success")
+            yield Button("Quit", id="btn-quit", variant="error")
         yield Label("Spectator: watch 4 AI bots play  |  Interactive: you play as East", id="hint")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -131,6 +207,8 @@ class ModeSelectScreen(Screen):
             self.app.push_screen(SpectatorScreen())
         elif event.button.id == "btn-interactive":
             self.app.push_screen(InteractiveScreen())
+        elif event.button.id == "btn-quit":
+            self.app.exit()
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +280,7 @@ class SpectatorScreen(Screen):
             yield Button("⏸ Pause", id="btn-pause")
             yield Button("New Game", id="btn-new", variant="primary")
             yield Button("← Back", id="btn-back")
+            yield Button("Quit", id="btn-quit", variant="error")
             yield Label("", id="status-bar")
         yield Footer()
 
@@ -254,23 +333,41 @@ class SpectatorScreen(Screen):
             elif ev.type == EventType.WIN_SELF_DRAW:
                 self._timer.stop()
                 self._refresh_all_panels()
+                tai = _win_tai_str(self._engine, ev.seat, ev.tile, self_draw=True)
                 log.write(
                     f"[bold green]🎉 {SEAT_NAMES[ev.seat]} wins by self-draw "
-                    f"on {_g(ev.tile)} {_gl(ev.tile)}![/bold green]"
+                    f"on {_g(ev.tile)} {_gl(ev.tile)}! — {tai}[/bold green]"
                 )
                 self.query_one("#status-bar", Label).update(
-                    f"[bold green]{SEAT_NAMES[ev.seat]} wins by tsumo![/bold green]"
+                    f"[bold green]{SEAT_NAMES[ev.seat]} wins by zi mo! — {tai}[/bold green]"
                 )
             elif ev.type == EventType.WIN_DISCARD:
                 self._timer.stop()
                 shooter = ev.detail.get("shooter")
                 self._refresh_all_panels()
+                tai = _win_tai_str(self._engine, ev.seat, ev.tile, self_draw=False)
                 log.write(
                     f"[bold green]🎉 {SEAT_NAMES[ev.seat]} wins!  "
-                    f"{SEAT_NAMES[shooter]} dealt {_g(ev.tile)} {_gl(ev.tile)}![/bold green]"
+                    f"{SEAT_NAMES[shooter]} dealt {_g(ev.tile)} {_gl(ev.tile)}! — {tai}[/bold green]"
                 )
                 self.query_one("#status-bar", Label).update(
-                    f"[bold green]{SEAT_NAMES[ev.seat]} wins by ron![/bold green]"
+                    f"[bold green]{SEAT_NAMES[ev.seat]} wins from {SEAT_NAMES[shooter]}'s discard! — {tai}[/bold green]"
+                )
+            elif ev.type == EventType.BONUS:
+                self._refresh_panel(ev.seat)
+                log.write(
+                    f"   [green]{SEAT_NAMES[ev.seat]} draws bonus: "
+                    f"{bonus_tile_name(ev.tile)}[/green]"
+                )
+            elif ev.type == EventType.MELD:
+                meld_type = ev.detail.get("meld_type", "meld").capitalize()
+                from_seat = ev.detail.get("from", -1)
+                from_str = f" from {SEAT_NAMES[from_seat]}" if from_seat in SEAT_NAMES else ""
+                tiles_str = " ".join(_g(t) for t in ev.detail.get("tiles", [ev.tile]))
+                self._refresh_panel(ev.seat)
+                log.write(
+                    f"   [bold cyan]{SEAT_NAMES[ev.seat]} claims {meld_type}{from_str}! "
+                    f"{tiles_str}[/bold cyan]"
                 )
             elif ev.type == EventType.WALL_EXHAUSTED:
                 self._timer.stop()
@@ -287,9 +384,22 @@ class SpectatorScreen(Screen):
         drawn = self._last_drawn.get(seat)
         discards_str = _discards_markup(player.discards)
         hand_str = _hand_markup(tiles, drawn)
+        n_tiles = int(player.hand.concealed.sum())
+        s = shanten(player.hand.concealed, len(player.hand.melds))
+        if s == -1:
+            tai_label = "[bold green]Win![/bold green]"
+        elif s == 0 and n_tiles == 13:
+            tai_label = f"[yellow]{_waiting_tai_label(player.hand, self._engine.prevailing_wind)}[/yellow]"
+        elif s == 0:
+            tai_label = "[yellow]Waiting[/yellow]"
+        else:
+            tai_label = f"Tiles away: {s}"
+        exposed = _exposed_row(player.hand)
+        exposed_line = f"\n{exposed}" if exposed else ""
         text = (
             f"[{name_color}]{arrow}{SEAT_NAMES[seat]}[/{name_color}]"
-            f"  ({len(tiles)} tiles, {len(player.discards)} discards)\n"
+            f"  ({len(tiles)} tiles, {len(player.discards)} discards)  {tai_label}"
+            f"{exposed_line}\n"
             f"{hand_str}\n"
             f"[dim]Discards:[/dim] {discards_str}"
         )
@@ -301,7 +411,9 @@ class SpectatorScreen(Screen):
 
     def _update_status(self) -> None:
         seat = self._engine.current_seat
+        table_wind = SEAT_NAMES.get(self._engine.prevailing_wind, "?")
         self.query_one("#status-bar", Label).update(
+            f"Table: {table_wind}  "
             f"Wall: {self._engine.wall_remaining}  "
             f"Turn: {self._engine.turn_number}  "
             f"Current: {SEAT_NAMES.get(seat, '—')}  "
@@ -326,6 +438,8 @@ class SpectatorScreen(Screen):
             self._new_game()
         elif bid == "btn-back":
             self.action_go_back()
+        elif bid == "btn-quit":
+            self.app.exit()
 
     def action_toggle_pause(self) -> None:
         btn = self.query_one("#btn-pause", Button)
@@ -354,7 +468,7 @@ class InteractiveScreen(Screen):
         layout: vertical;
     }
     #opp-row {
-        height: 8;
+        height: 10;
         border-bottom: solid $primary;
     }
     .opp-panel {
@@ -367,13 +481,19 @@ class InteractiveScreen(Screen):
         color: $accent;
     }
     #hand-area {
-        height: 7;
+        height: 9;
         padding: 0 2;
         border-bottom: solid $primary;
     }
     #hand-title {
         text-style: bold;
         color: $accent;
+    }
+    #meld-display {
+        height: 2;
+        color: $text;
+        border-bottom: dashed $surface-darken-2;
+        padding-bottom: 0;
     }
     #hand-display {
         height: 3;
@@ -435,6 +555,7 @@ class InteractiveScreen(Screen):
                     yield Static("", id=f"opp-disc-{seat}")
         with Vertical(id="hand-area"):
             yield Label("Your Hand (East)", id="hand-title")
+            yield Static("", id="meld-display")
             yield Static("—", id="hand-display")
             with Horizontal(id="discard-row"):
                 yield Input(placeholder="tile (e.g. b1, ew)", id="discard-input",
@@ -450,12 +571,13 @@ class InteractiveScreen(Screen):
         with Horizontal(id="action-row"):
             yield Button("New Game", id="btn-new", variant="primary")
             yield Button("← Back", id="btn-back")
+            yield Button("Quit", id="btn-quit", variant="error")
             yield Label("", id="status-bar")
         yield Footer()
 
     def on_mount(self) -> None:
         rec = self.query_one("#rec-table", DataTable)
-        rec.add_columns("#", "Discard", "Shanten", "Accepts", "Danger", "Utility")
+        rec.add_columns("#", "Discard", "Tiles away", "Accepts", "Danger", "Utility")
         rec.cursor_type = "none"
 
         self._drawn_tid: Optional[int] = None
@@ -527,11 +649,11 @@ class InteractiveScreen(Screen):
                 if self._ai_timer:
                     self._ai_timer.stop()
                 self._refresh_hand()
-                msg = (
-                    f"[bold green]🎉 You win by self-draw on {_g(ev.tile)} {_gl(ev.tile)}![/bold green]"
-                    if ev.seat == self.MY_SEAT
-                    else f"[bold red]{SEAT_NAMES[ev.seat]} wins by tsumo![/bold red]"
-                )
+                tai = _win_tai_str(self._engine, ev.seat, ev.tile, self_draw=True)
+                if ev.seat == self.MY_SEAT:
+                    msg = f"[bold green]🎉 You win by self-draw on {_g(ev.tile)} {_gl(ev.tile)}! — {tai}[/bold green]"
+                else:
+                    msg = f"[bold red]{SEAT_NAMES[ev.seat]} wins by zi mo! — {tai}[/bold red]"
                 log.write(msg)
                 self.query_one("#status-bar", Label).update(msg)
                 self.query_one("#discard-input", Input).disabled = True
@@ -540,25 +662,48 @@ class InteractiveScreen(Screen):
                 if self._ai_timer:
                     self._ai_timer.stop()
                 shooter = ev.detail.get("shooter")
+                tai = _win_tai_str(self._engine, ev.seat, ev.tile, self_draw=False)
                 if ev.seat == self.MY_SEAT:
                     msg = (
                         f"[bold green]🎉 You win! {SEAT_NAMES[shooter]} dealt "
-                        f"{_g(ev.tile)} {_gl(ev.tile)}![/bold green]"
+                        f"{_g(ev.tile)} {_gl(ev.tile)}! — {tai}[/bold green]"
                     )
                 elif shooter == self.MY_SEAT:
                     msg = (
                         f"[bold red]You shot! {SEAT_NAMES[ev.seat]} wins from your "
-                        f"{_g(ev.tile)} {_gl(ev.tile)} discard![/bold red]"
+                        f"{_g(ev.tile)} {_gl(ev.tile)} discard! — {tai}[/bold red]"
                     )
                 else:
                     msg = (
                         f"[bold red]{SEAT_NAMES[ev.seat]} wins! "
-                        f"{SEAT_NAMES[shooter]} dealt {_g(ev.tile)} {_gl(ev.tile)}![/bold red]"
+                        f"{SEAT_NAMES[shooter]} dealt {_g(ev.tile)} {_gl(ev.tile)}! — {tai}[/bold red]"
                     )
                 log.write(msg)
                 self.query_one("#status-bar", Label).update(msg)
                 self.query_one("#discard-input", Input).disabled = True
                 self.query_one("#discard-hint", Label).update("[bold]Game over. Press New Game.[/bold]")
+            elif ev.type == EventType.BONUS:
+                if ev.seat == self.MY_SEAT:
+                    self._refresh_hand()
+                else:
+                    self._update_opponent_panels()
+                log.write(
+                    f"   [green]{SEAT_NAMES[ev.seat]} draws bonus: "
+                    f"{bonus_tile_name(ev.tile)}[/green]"
+                )
+            elif ev.type == EventType.MELD:
+                meld_type = ev.detail.get("meld_type", "meld").capitalize()
+                from_seat = ev.detail.get("from", -1)
+                from_str = f" from {SEAT_NAMES[from_seat]}" if from_seat in SEAT_NAMES else ""
+                tiles_str = " ".join(f"{_g(t)} {_gl(t)}" for t in ev.detail.get("tiles", [ev.tile]))
+                if ev.seat == self.MY_SEAT:
+                    self._refresh_hand()
+                else:
+                    self._update_opponent_panels()
+                log.write(
+                    f"   [bold cyan]{SEAT_NAMES[ev.seat]} claims {meld_type}{from_str}! "
+                    f"{tiles_str}[/bold cyan]"
+                )
             elif ev.type == EventType.WALL_EXHAUSTED:
                 if self._ai_timer:
                     self._ai_timer.stop()
@@ -604,13 +749,26 @@ class InteractiveScreen(Screen):
             return
         player = self._engine.players[self.MY_SEAT]
         tiles = player.hand.concealed_tiles_list()
-        from cracked.shanten import shanten
         s = shanten(player.hand.concealed, len(player.hand.melds))
-        shanten_str = "tenpai!" if s == 0 else ("win!" if s == -1 else str(s))
+        n_tiles = int(player.hand.concealed.sum())
+        if s == -1:
+            shanten_str = "[bold green]win![/bold green]"
+        elif s == 0 and n_tiles == 13:
+            shanten_str = f"[yellow]{_waiting_tai_label(player.hand, self._engine.prevailing_wind)}[/yellow]"
+        elif s == 0:
+            shanten_str = "[yellow]waiting![/yellow]"
+        else:
+            shanten_str = str(s)
         wall = self._engine.wall_remaining
+        table_wind = SEAT_NAMES.get(self._engine.prevailing_wind, "?")
         self.query_one("#hand-title", Label).update(
-            f"[bold]Your Hand (East)[/bold]  —  Shanten: [bold]{shanten_str}[/bold]"
+            f"[bold]Your Hand (East)[/bold]  —  Tiles away: {shanten_str}"
+            f"  |  Table: [yellow]{table_wind}[/yellow]"
             f"  |  Wall: {wall}  Turn: {self._engine.turn_number}"
+        )
+        exposed = _exposed_row(player.hand)
+        self.query_one("#meld-display", Static).update(
+            exposed if exposed else "[dim]No exposed melds[/dim]"
         )
         self.query_one("#hand-display", Static).update(
             _hand_markup(tiles, self._drawn_tid)
@@ -622,9 +780,12 @@ class InteractiveScreen(Screen):
         for seat in [int(Wind.NORTH), int(Wind.SOUTH), int(Wind.WEST)]:
             player = self._engine.players[seat]
             discs = _discards_markup(player.discards)
-            self.query_one(f"#opp-disc-{seat}", Static).update(
-                f"[dim]Discards:[/dim] {discs if discs else '—'}"
-            )
+            exposed = _exposed_row(player.hand)
+            lines: list[str] = []
+            if exposed:
+                lines.append(exposed)
+            lines.append(f"[dim]Discards:[/dim] {discs if discs else '—'}")
+            self.query_one(f"#opp-disc-{seat}", Static).update("\n".join(lines))
 
     @work(thread=True)
     def _compute_recommendations(self) -> None:
@@ -639,7 +800,7 @@ class InteractiveScreen(Screen):
             table = self.query_one("#rec-table", DataTable)
             table.clear()
             for i, r in enumerate(recs[:8], 1):
-                s_str = "tenpai" if r.shanten_after == 0 else ("win" if r.shanten_after == -1 else str(r.shanten_after))
+                s_str = "waiting" if r.shanten_after == 0 else ("win" if r.shanten_after == -1 else str(r.shanten_after))
                 table.add_row(
                     str(i),
                     f"{tile_glyph(r.tile_id)} {tile_name(r.tile_id).upper()}",
@@ -649,7 +810,7 @@ class InteractiveScreen(Screen):
                     f"{r.utility:.3f}",
                 )
 
-        self.call_from_thread(_update)
+        self.app.call_from_thread(_update)
 
     def _clear_recommendations(self) -> None:
         self.query_one("#rec-table", DataTable).clear()
@@ -659,6 +820,8 @@ class InteractiveScreen(Screen):
             self._new_game()
         elif event.button.id == "btn-back":
             self.action_go_back()
+        elif event.button.id == "btn-quit":
+            self.app.exit()
 
     def action_go_back(self) -> None:
         if self._ai_timer:

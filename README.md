@@ -123,12 +123,29 @@ Shows predictions from a trained DangerNet alongside the heuristic table. Requir
 Requires `pip install -e ".[ui]"` (adds the `textual` package).
 
 ```bash
-# Advisor mode — enter your hand, get recommendations, track game state interactively
+# Advisor mode — enter your hand and draws, get heuristic + Monte Carlo recommendations
 cracked-ui
 
-# Watch mode — watch a fully simulated game play out with heuristic AI on all seats
+# Game viewer — choose spectator or interactive mode
 cracked-play
 ```
+
+### Advisor mode (`cracked-ui`)
+
+Enter any 13-tile hand and a draw tile. Press **R** to get ranked discard recommendations (shanten, acceptance tiles, danger score, utility). Press **S** to run Monte Carlo simulation. Use the seat and prevailing wind dropdowns.
+
+### Game viewer (`cracked-play`)
+
+On launch, choose a mode:
+
+**Spectator** — watch four heuristic AI bots play a full game. Claim mechanics (pong, kong, chow) are live: bots evaluate each discard and claim when it improves their hand. Bonus tiles (flowers, seasons, animals) are drawn and replaced automatically. Adjust speed or pause at any time.
+
+**Interactive** — you play as East against three AI opponents. The engine pauses on your turn, shows ranked discard recommendations, and accepts tile names (`b1`, `ew`, `rd`, etc.) as input. Opponents claim your discards using the same heuristic.
+
+Both modes show:
+- Each player's concealed tiles (glyphs + labels), tiles-away / waiting status, and potential tai range
+- Exposed melds (pong/kong/chow) and bonus tiles (flowers/seasons green, animals yellow) above the hand
+- Discard piles and a live game log with claim announcements
 
 ---
 
