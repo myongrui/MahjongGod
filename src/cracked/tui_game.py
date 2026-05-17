@@ -15,6 +15,7 @@ from textual.timer import Timer
 
 from cracked.tiles import tile_name, NTILES, Wind, bonus_tile_name, is_animal
 from cracked.engine import GameEngine, EventType, GameEvent
+from cracked.match import GameMatch, WIND_NAMES
 from cracked.shanten import shanten
 from cracked.scoring import calculate_tai, WinContext, DEFAULT_RULES
 
@@ -116,6 +117,13 @@ def _exposed_row(hand) -> str:
 
 
 SEAT_NAMES = {27: "East", 28: "South", 29: "West", 30: "North"}
+
+
+def _player_label(match: "GameMatch", seat: int) -> str:
+    """Return e.g. 'Player 2 (South)' for the player currently at this wind seat."""
+    num = match.player_at.get(seat, "?")
+    wind = SEAT_NAMES.get(seat, "?")
+    return f"Player {num} ({wind})"
 
 
 def _win_tai_str(engine: GameEngine, seat: int, tile: int, self_draw: bool) -> str:
@@ -268,8 +276,8 @@ class SpectatorScreen(Screen):
         yield Header()
         with Horizontal(id="top-area"):
             with ScrollableContainer(id="player-col"):
-                for seat in [int(Wind.NORTH), int(Wind.WEST),
-                             int(Wind.EAST), int(Wind.SOUTH)]:
+                for seat in [int(Wind.EAST), int(Wind.SOUTH),
+                             int(Wind.WEST), int(Wind.NORTH)]:
                     yield Static("", id=f"panel-{seat}", classes="player-panel")
             with ScrollableContainer(id="log-col"):
                 yield Label("[bold]Game Log[/bold]")
@@ -278,106 +286,149 @@ class SpectatorScreen(Screen):
             yield Button("◀ Slower", id="btn-slower")
             yield Button("Faster ▶", id="btn-faster")
             yield Button("⏸ Pause", id="btn-pause")
-            yield Button("New Game", id="btn-new", variant="primary")
+            yield Button("New Match", id="btn-new", variant="primary")
             yield Button("← Back", id="btn-back")
             yield Button("Quit", id="btn-quit", variant="error")
             yield Label("", id="status-bar")
+            yield Label("", id="table-wind-label")
         yield Footer()
 
     def on_mount(self) -> None:
         self._speed: float = 0.8   # seconds per step
         self._paused: bool = False
-        self._engine = GameEngine(seed=None)
+        self._match: GameMatch = GameMatch()
         self._last_drawn: dict[int, Optional[int]] = {s: None for s in [27, 28, 29, 30]}
-        self._new_game()
+        self._new_match()
 
-    def _new_game(self) -> None:
-        self._engine = GameEngine(seed=None)
-        events = self._engine.deal()
+    def _new_match(self) -> None:
+        self._match = GameMatch()
+        self._start_hand("[bold]New match started — East Round, Hand 1.[/bold]")
+
+    def _start_hand(self, intro: str = "") -> None:
+        events = self._match.start_hand()
         self._last_drawn = {s: None for s in [27, 28, 29, 30]}
         log = self.query_one("#game-log", RichLog)
-        log.clear()
-        log.write("[bold]New game started.[/bold]")
+        if intro:
+            log.write(intro)
+        self._process_events(events)
         self._refresh_all_panels()
         self._update_status()
         if hasattr(self, "_timer"):
             self._timer.stop()
         self._timer: Timer = self.set_interval(self._speed, self._tick)
 
+    def _next_hand(self) -> None:
+        result = self._match.finish_hand()
+        log = self.query_one("#game-log", RichLog)
+        if result.rotated:
+            new_east_player = _player_label(self._match, int(Wind.EAST))
+            log.write(
+                f"[cyan]Winds rotate (S→E, E→N, N→W, W→S) — {new_east_player} deals next.[/cyan]"
+            )
+        else:
+            log.write("[cyan]Dealer wins — no rotation, Dealer deals again.[/cyan]")
+        if self._match.is_complete:
+            log.write("[bold green]Match complete![/bold green]")
+            self._show_final_standings(log)
+            self.query_one("#status-bar", Label).update("[bold green]Match over.[/bold green]")
+            return
+        intro = (
+            f"[bold]{self._match.round_label}, Hand {self._match.hand_number}[/bold]"
+        )
+        self._start_hand(intro)
+
+    def _show_final_standings(self, log: RichLog) -> None:
+        log.write("[bold]Final standings:[/bold]")
+        sorted_chips = sorted(self._match.chips.items(), key=lambda x: -x[1])
+        for wind, chips in sorted_chips:
+            log.write(f"  {_player_label(self._match, wind):20s}  ★{chips}")
+
     def _tick(self) -> None:
-        if self._engine.is_finished:
+        if self._match.engine is None or self._match.engine.is_finished:
             self._timer.stop()
             return
-        events = self._engine.step()
+        events = self._match.engine.step()
         self._process_events(events)
 
     def _process_events(self, events: list[GameEvent]) -> None:
         log = self.query_one("#game-log", RichLog)
+        engine = self._match.engine
         for ev in events:
             if ev.type == EventType.DRAW:
                 self._last_drawn[ev.seat] = ev.tile
                 self._refresh_panel(ev.seat)
                 self._update_status()
                 log.write(
-                    f"T{self._engine.turn_number}  "
-                    f"[bold]{SEAT_NAMES[ev.seat]}[/bold] drew "
+                    f"T{engine.turn_number}  "
+                    f"[bold]{_player_label(self._match, ev.seat)}[/bold] drew "
                     f"{_g(ev.tile)} {_gl(ev.tile)}"
                 )
             elif ev.type == EventType.DISCARD:
                 self._last_drawn[ev.seat] = None
                 self._refresh_panel(ev.seat)
                 log.write(
-                    f"   [dim]{SEAT_NAMES[ev.seat]} discarded "
+                    f"   [dim]{_player_label(self._match, ev.seat)} discarded "
                     f"{_g(ev.tile)} {_gl(ev.tile)}[/dim]"
                 )
             elif ev.type == EventType.WIN_SELF_DRAW:
                 self._timer.stop()
                 self._refresh_all_panels()
-                tai = _win_tai_str(self._engine, ev.seat, ev.tile, self_draw=True)
+                tai = _win_tai_str(engine, ev.seat, ev.tile, self_draw=True)
+                zimo_pay = ev.detail.get("zimo_pay", "?")
+                winner_label = _player_label(self._match, ev.seat)
                 log.write(
-                    f"[bold green]🎉 {SEAT_NAMES[ev.seat]} wins by self-draw "
-                    f"on {_g(ev.tile)} {_gl(ev.tile)}! — {tai}[/bold green]"
+                    f"[bold green]🎉 {winner_label} wins by self-draw "
+                    f"on {_g(ev.tile)} {_gl(ev.tile)}! — {tai}  "
+                    f"(+{zimo_pay * 3 if isinstance(zimo_pay, int) else '?'} ★, each pays {zimo_pay} ★)[/bold green]"
                 )
                 self.query_one("#status-bar", Label).update(
-                    f"[bold green]{SEAT_NAMES[ev.seat]} wins by zi mo! — {tai}[/bold green]"
+                    f"[bold green]{winner_label} wins zi mo! — {tai}  each pays {zimo_pay} ★[/bold green]"
                 )
+                self.set_timer(2.0, self._next_hand)
             elif ev.type == EventType.WIN_DISCARD:
                 self._timer.stop()
                 shooter = ev.detail.get("shooter")
                 self._refresh_all_panels()
-                tai = _win_tai_str(self._engine, ev.seat, ev.tile, self_draw=False)
+                tai = _win_tai_str(engine, ev.seat, ev.tile, self_draw=False)
+                shooter_pay = ev.detail.get("shooter_pay", "?")
+                winner_label = _player_label(self._match, ev.seat)
+                shooter_label = _player_label(self._match, shooter) if shooter in SEAT_NAMES else "?"
                 log.write(
-                    f"[bold green]🎉 {SEAT_NAMES[ev.seat]} wins!  "
-                    f"{SEAT_NAMES[shooter]} dealt {_g(ev.tile)} {_gl(ev.tile)}! — {tai}[/bold green]"
+                    f"[bold green]🎉 {winner_label} wins!  "
+                    f"{shooter_label} dealt {_g(ev.tile)} {_gl(ev.tile)}! — {tai}  "
+                    f"({shooter_label} pays {shooter_pay} ★)[/bold green]"
                 )
                 self.query_one("#status-bar", Label).update(
-                    f"[bold green]{SEAT_NAMES[ev.seat]} wins from {SEAT_NAMES[shooter]}'s discard! — {tai}[/bold green]"
+                    f"[bold green]{winner_label} wins from {shooter_label}! — {tai}  {shooter_pay} ★[/bold green]"
                 )
+                self.set_timer(2.0, self._next_hand)
             elif ev.type == EventType.BONUS:
                 self._refresh_panel(ev.seat)
                 log.write(
-                    f"   [green]{SEAT_NAMES[ev.seat]} draws bonus: "
+                    f"   [green]{_player_label(self._match, ev.seat)} draws bonus: "
                     f"{bonus_tile_name(ev.tile)}[/green]"
                 )
             elif ev.type == EventType.MELD:
                 meld_type = ev.detail.get("meld_type", "meld").capitalize()
                 from_seat = ev.detail.get("from", -1)
-                from_str = f" from {SEAT_NAMES[from_seat]}" if from_seat in SEAT_NAMES else ""
+                from_str = f" from {_player_label(self._match, from_seat)}" if from_seat in SEAT_NAMES else ""
                 tiles_str = " ".join(_g(t) for t in ev.detail.get("tiles", [ev.tile]))
                 self._refresh_panel(ev.seat)
                 log.write(
-                    f"   [bold cyan]{SEAT_NAMES[ev.seat]} claims {meld_type}{from_str}! "
+                    f"   [bold cyan]{_player_label(self._match, ev.seat)} claims {meld_type}{from_str}! "
                     f"{tiles_str}[/bold cyan]"
                 )
             elif ev.type == EventType.WALL_EXHAUSTED:
                 self._timer.stop()
                 log.write("[yellow]Wall exhausted — draw game.[/yellow]")
                 self.query_one("#status-bar", Label).update("[yellow]Draw game.[/yellow]")
+                self.set_timer(2.0, self._next_hand)
 
     def _refresh_panel(self, seat: int) -> None:
         panel = self.query_one(f"#panel-{seat}", Static)
-        player = self._engine.players[seat]
-        is_current = (seat == self._engine.current_seat and not self._engine.is_finished)
+        engine = self._match.engine
+        player = engine.players[seat]
+        is_current = (seat == engine.current_seat and not engine.is_finished)
         arrow = "▶ " if is_current else "  "
         name_color = "bold yellow" if is_current else "bold"
         tiles = player.hand.concealed_tiles_list()
@@ -389,16 +440,18 @@ class SpectatorScreen(Screen):
         if s == -1:
             tai_label = "[bold green]Win![/bold green]"
         elif s == 0 and n_tiles == 13:
-            tai_label = f"[yellow]{_waiting_tai_label(player.hand, self._engine.prevailing_wind)}[/yellow]"
+            tai_label = f"[yellow]{_waiting_tai_label(player.hand, engine.prevailing_wind)}[/yellow]"
         elif s == 0:
             tai_label = "[yellow]Waiting[/yellow]"
         else:
             tai_label = f"Tiles away: {s}"
         exposed = _exposed_row(player.hand)
         exposed_line = f"\n{exposed}" if exposed else ""
+        chips = engine.chips.get(seat, 0)
         text = (
-            f"[{name_color}]{arrow}{SEAT_NAMES[seat]}[/{name_color}]"
+            f"[{name_color}]{arrow}{_player_label(self._match, seat)}[/{name_color}]"
             f"  ({len(tiles)} tiles, {len(player.discards)} discards)  {tai_label}"
+            f"  [yellow]★{chips}[/yellow]"
             f"{exposed_line}\n"
             f"{hand_str}\n"
             f"[dim]Discards:[/dim] {discards_str}"
@@ -410,14 +463,15 @@ class SpectatorScreen(Screen):
             self._refresh_panel(seat)
 
     def _update_status(self) -> None:
-        seat = self._engine.current_seat
-        table_wind = SEAT_NAMES.get(self._engine.prevailing_wind, "?")
+        engine = self._match.engine
+        seat = engine.current_seat
         self.query_one("#status-bar", Label).update(
-            f"Table: {table_wind}  "
-            f"Wall: {self._engine.wall_remaining}  "
-            f"Turn: {self._engine.turn_number}  "
-            f"Current: {SEAT_NAMES.get(seat, '—')}  "
+            f"Round {self._match.hand_number}  "
+            f"Wall: {engine.wall_remaining}  "
+            f"Turn: {engine.turn_number}  "
+            f"Current: {_player_label(self._match, seat)}  "
             f"Speed: {self._speed:.1f}s"
+            f"\n[bold yellow]Table Wind: {WIND_NAMES[self._match.table_wind]}[/bold yellow]"
         )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -435,7 +489,7 @@ class SpectatorScreen(Screen):
         elif bid == "btn-pause":
             self.action_toggle_pause()
         elif bid == "btn-new":
-            self._new_game()
+            self._new_match()
         elif bid == "btn-back":
             self.action_go_back()
         elif bid == "btn-quit":
@@ -544,15 +598,13 @@ class InteractiveScreen(Screen):
         ("escape", "go_back", "Back"),
     ]
 
-    MY_SEAT = int(Wind.EAST)
-
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="opp-row"):
-            for seat in [int(Wind.NORTH), int(Wind.SOUTH), int(Wind.WEST)]:
-                with Vertical(classes="opp-panel", id=f"opp-{seat}"):
-                    yield Label(SEAT_NAMES[seat], classes="opp-panel-title")
-                    yield Static("", id=f"opp-disc-{seat}")
+            for i in range(3):
+                with Vertical(classes="opp-panel", id=f"opp-{i}"):
+                    yield Label("", classes="opp-panel-title", id=f"opp-title-{i}")
+                    yield Static("", id=f"opp-disc-{i}")
         with Vertical(id="hand-area"):
             yield Label("Your Hand (East)", id="hand-title")
             yield Static("", id="meld-display")
@@ -569,36 +621,59 @@ class InteractiveScreen(Screen):
                 yield Label("Game Log", classes="section-label")
                 yield RichLog(id="game-log", highlight=False, markup=True, wrap=True)
         with Horizontal(id="action-row"):
-            yield Button("New Game", id="btn-new", variant="primary")
+            yield Button("New Match", id="btn-new", variant="primary")
+            yield Button("Next Hand", id="btn-next", variant="success", disabled=True)
             yield Button("← Back", id="btn-back")
             yield Button("Quit", id="btn-quit", variant="error")
             yield Label("", id="status-bar")
+            yield Label("", id="table-wind-label")
         yield Footer()
 
     def on_mount(self) -> None:
         rec = self.query_one("#rec-table", DataTable)
-        rec.add_columns("#", "Discard", "Tiles away", "Accepts", "Danger", "Utility")
+        rec.add_columns("#", "Discard", "Tiles away", "Accepts", "Danger", "Tai pot", "Utility")
         rec.cursor_type = "none"
 
         self._drawn_tid: Optional[int] = None
-        self._engine: Optional[GameEngine] = None
+        self._match: Optional[GameMatch] = None
         self._ai_timer: Optional[Timer] = None
-        self._new_game()
+        self._new_match()
 
-    def _new_game(self) -> None:
+    @property
+    def _my_seat(self) -> int:
+        return self._match.human_wind if self._match else int(Wind.EAST)
+
+    @property
+    def _engine(self) -> Optional[GameEngine]:
+        return self._match.engine if self._match else None
+
+    def _new_match(self) -> None:
         if self._ai_timer is not None:
             self._ai_timer.stop()
-        self._engine = GameEngine(human_seats={self.MY_SEAT}, seed=None)
-        self._drawn_tid = None
-        events = self._engine.deal()
+        self._match = GameMatch(human_initial_wind=int(Wind.EAST))
         log = self.query_one("#game-log", RichLog)
         log.clear()
-        log.write("[bold]New game — you are East.[/bold]")
+        self.query_one("#btn-next", Button).disabled = True
+        self._start_hand(f"[bold]New match — you are {WIND_NAMES[self._my_seat]}.[/bold]")
+
+    def _start_hand(self, intro: str = "") -> None:
+        if self._ai_timer is not None:
+            self._ai_timer.stop()
+        events = self._match.start_hand()
+        self._drawn_tid = None
+        log = self.query_one("#game-log", RichLog)
+        if intro:
+            log.write(intro)
+        self._update_opponent_labels()
         self._update_opponent_panels()
         self._clear_recommendations()
         self.query_one("#discard-input", Input).disabled = True
         self.query_one("#discard-hint", Label).update("")
-        # Start advancing (first step will be East's draw → AWAIT_DISCARD)
+        self.query_one("#btn-next", Button).disabled = True
+        self.query_one("#table-wind-label", Label).update(
+            f"[bold yellow]Table Wind: {WIND_NAMES[self._match.table_wind]}[/bold yellow]"
+        )
+        self._process_events(events)
         self._ai_timer = self.set_interval(0.35, self._tick)
 
     def _tick(self) -> None:
@@ -611,17 +686,18 @@ class InteractiveScreen(Screen):
 
     def _process_events(self, events: list[GameEvent]) -> None:
         log = self.query_one("#game-log", RichLog)
+        engine = self._engine
         for ev in events:
             if ev.type == EventType.DEAL:
                 pass
             elif ev.type == EventType.DRAW:
-                if ev.seat == self.MY_SEAT:
+                if ev.seat == self._my_seat:
                     self._drawn_tid = ev.tile
                     self._refresh_hand()
                 log.write(
-                    f"T{self._engine.turn_number}  "
-                    f"[bold]{SEAT_NAMES[ev.seat]}[/bold] drew "
-                    + (f"{_g(ev.tile)} {_gl(ev.tile)}" if ev.seat == self.MY_SEAT else "[dim]a tile[/dim]")
+                    f"T{engine.turn_number}  "
+                    f"[bold]{_player_label(self._match, ev.seat)}[/bold] drew "
+                    + (f"{_g(ev.tile)} {_gl(ev.tile)}" if ev.seat == self._my_seat else "[dim]a tile[/dim]")
                 )
             elif ev.type == EventType.AWAIT_DISCARD:
                 if self._ai_timer:
@@ -635,73 +711,81 @@ class InteractiveScreen(Screen):
                 )
                 self._compute_recommendations()
             elif ev.type == EventType.DISCARD:
-                if ev.seat == self.MY_SEAT:
+                if ev.seat == self._my_seat:
                     self._drawn_tid = None
                     self._refresh_hand()
                     self.query_one("#discard-hint", Label).update("")
                 else:
                     self._update_opponent_panels()
                 log.write(
-                    f"[dim]   {SEAT_NAMES[ev.seat]} discarded "
+                    f"[dim]   {_player_label(self._match, ev.seat)} discarded "
                     f"{_g(ev.tile)} {_gl(ev.tile)}[/dim]"
                 )
             elif ev.type == EventType.WIN_SELF_DRAW:
                 if self._ai_timer:
                     self._ai_timer.stop()
                 self._refresh_hand()
-                tai = _win_tai_str(self._engine, ev.seat, ev.tile, self_draw=True)
-                if ev.seat == self.MY_SEAT:
-                    msg = f"[bold green]🎉 You win by self-draw on {_g(ev.tile)} {_gl(ev.tile)}! — {tai}[/bold green]"
+                self._update_opponent_panels()
+                tai = _win_tai_str(engine, ev.seat, ev.tile, self_draw=True)
+                zimo_pay = ev.detail.get("zimo_pay", "?")
+                chip_str = f"  each pays {zimo_pay} ★"
+                if ev.seat == self._my_seat:
+                    msg = f"[bold green]🎉 You win by self-draw on {_g(ev.tile)} {_gl(ev.tile)}! — {tai}{chip_str}[/bold green]"
                 else:
-                    msg = f"[bold red]{SEAT_NAMES[ev.seat]} wins by zi mo! — {tai}[/bold red]"
+                    msg = f"[bold red]{_player_label(self._match, ev.seat)} wins zi mo! — {tai}{chip_str}[/bold red]"
                 log.write(msg)
                 self.query_one("#status-bar", Label).update(msg)
                 self.query_one("#discard-input", Input).disabled = True
-                self.query_one("#discard-hint", Label).update("[bold]Game over. Press New Game.[/bold]")
+                self._on_hand_over()
             elif ev.type == EventType.WIN_DISCARD:
                 if self._ai_timer:
                     self._ai_timer.stop()
+                self._refresh_hand()
+                self._update_opponent_panels()
                 shooter = ev.detail.get("shooter")
-                tai = _win_tai_str(self._engine, ev.seat, ev.tile, self_draw=False)
-                if ev.seat == self.MY_SEAT:
+                tai = _win_tai_str(engine, ev.seat, ev.tile, self_draw=False)
+                shooter_pay = ev.detail.get("shooter_pay", "?")
+                shooter_label = _player_label(self._match, shooter) if shooter in SEAT_NAMES else "?"
+                if ev.seat == self._my_seat:
                     msg = (
-                        f"[bold green]🎉 You win! {SEAT_NAMES[shooter]} dealt "
-                        f"{_g(ev.tile)} {_gl(ev.tile)}! — {tai}[/bold green]"
+                        f"[bold green]🎉 You win! {shooter_label} dealt "
+                        f"{_g(ev.tile)} {_gl(ev.tile)}! — {tai}  (+{shooter_pay} ★)[/bold green]"
                     )
-                elif shooter == self.MY_SEAT:
+                elif shooter == self._my_seat:
                     msg = (
-                        f"[bold red]You shot! {SEAT_NAMES[ev.seat]} wins from your "
-                        f"{_g(ev.tile)} {_gl(ev.tile)} discard! — {tai}[/bold red]"
+                        f"[bold red]You shot! {_player_label(self._match, ev.seat)} wins from your "
+                        f"{_g(ev.tile)} {_gl(ev.tile)} discard! — {tai}  (-{shooter_pay} ★)[/bold red]"
                     )
                 else:
                     msg = (
-                        f"[bold red]{SEAT_NAMES[ev.seat]} wins! "
-                        f"{SEAT_NAMES[shooter]} dealt {_g(ev.tile)} {_gl(ev.tile)}! — {tai}[/bold red]"
+                        f"[bold red]{_player_label(self._match, ev.seat)} wins! "
+                        f"{shooter_label} dealt {_g(ev.tile)} {_gl(ev.tile)}! — {tai}  "
+                        f"({shooter_label} pays {shooter_pay} ★)[/bold red]"
                     )
                 log.write(msg)
                 self.query_one("#status-bar", Label).update(msg)
                 self.query_one("#discard-input", Input).disabled = True
-                self.query_one("#discard-hint", Label).update("[bold]Game over. Press New Game.[/bold]")
+                self._on_hand_over()
             elif ev.type == EventType.BONUS:
-                if ev.seat == self.MY_SEAT:
+                if ev.seat == self._my_seat:
                     self._refresh_hand()
                 else:
                     self._update_opponent_panels()
                 log.write(
-                    f"   [green]{SEAT_NAMES[ev.seat]} draws bonus: "
+                    f"   [green]{_player_label(self._match, ev.seat)} draws bonus: "
                     f"{bonus_tile_name(ev.tile)}[/green]"
                 )
             elif ev.type == EventType.MELD:
                 meld_type = ev.detail.get("meld_type", "meld").capitalize()
                 from_seat = ev.detail.get("from", -1)
-                from_str = f" from {SEAT_NAMES[from_seat]}" if from_seat in SEAT_NAMES else ""
+                from_str = f" from {_player_label(self._match, from_seat)}" if from_seat in SEAT_NAMES else ""
                 tiles_str = " ".join(f"{_g(t)} {_gl(t)}" for t in ev.detail.get("tiles", [ev.tile]))
-                if ev.seat == self.MY_SEAT:
+                if ev.seat == self._my_seat:
                     self._refresh_hand()
                 else:
                     self._update_opponent_panels()
                 log.write(
-                    f"   [bold cyan]{SEAT_NAMES[ev.seat]} claims {meld_type}{from_str}! "
+                    f"   [bold cyan]{_player_label(self._match, ev.seat)} claims {meld_type}{from_str}! "
                     f"{tiles_str}[/bold cyan]"
                 )
             elif ev.type == EventType.WALL_EXHAUSTED:
@@ -710,6 +794,30 @@ class InteractiveScreen(Screen):
                 log.write("[yellow]Wall exhausted — draw game.[/yellow]")
                 self.query_one("#status-bar", Label).update("[yellow]Draw game.[/yellow]")
                 self.query_one("#discard-input", Input).disabled = True
+                self._on_hand_over()
+
+    def _on_hand_over(self) -> None:
+        """Called when a hand ends. Preview the next rotation and enable Next Hand."""
+        result = self._match.finish_hand()
+        log = self.query_one("#game-log", RichLog)
+        if result.rotated:
+            new_my = WIND_NAMES.get(self._my_seat, "?")
+            log.write(f"[cyan]Winds rotate (S→E, E→N, N→W, W→S) — you are now {new_my}.[/cyan]")
+        else:
+            log.write("[cyan]East wins — no rotation.[/cyan]")
+        if self._match.is_complete:
+            log.write("[bold green]Match complete![/bold green]")
+            sorted_chips = sorted(self._match.chips.items(), key=lambda x: -x[1])
+            for wind, chips in sorted_chips:
+                log.write(f"  {_player_label(self._match, wind):20s}  ★{chips}")
+            self.query_one("#discard-hint", Label).update("[bold]Match over. Press New Match.[/bold]")
+        else:
+            hint = (
+                f"[bold]{self._match.round_label}, Hand {self._match.hand_number} — "
+                f"you are {WIND_NAMES.get(self._my_seat, '?')}.[/bold]  Press Next Hand."
+            )
+            self.query_one("#discard-hint", Label).update(hint)
+            self.query_one("#btn-next", Button).disabled = False
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if not self._engine or not self._engine.awaiting_human_discard:
@@ -744,10 +852,17 @@ class InteractiveScreen(Screen):
         if not self._engine.is_finished:
             self._ai_timer = self.set_interval(0.35, self._tick)
 
+    def _update_opponent_labels(self) -> None:
+        """Update opponent panel titles to reflect current wind assignments."""
+        opp_seats = [s for s in [int(Wind.NORTH), int(Wind.SOUTH), int(Wind.WEST),
+                                  int(Wind.EAST)] if s != self._my_seat]
+        for i, seat in enumerate(opp_seats):
+            self.query_one(f"#opp-title-{i}", Label).update(_player_label(self._match, seat))
+
     def _refresh_hand(self) -> None:
         if self._engine is None:
             return
-        player = self._engine.players[self.MY_SEAT]
+        player = self._engine.players[self._my_seat]
         tiles = player.hand.concealed_tiles_list()
         s = shanten(player.hand.concealed, len(player.hand.melds))
         n_tiles = int(player.hand.concealed.sum())
@@ -761,10 +876,16 @@ class InteractiveScreen(Screen):
             shanten_str = str(s)
         wall = self._engine.wall_remaining
         table_wind = SEAT_NAMES.get(self._engine.prevailing_wind, "?")
+        my_chips = self._engine.chips.get(self._my_seat, 0)
+        my_player_num = self._match.player_at.get(self._my_seat, "?") if self._match else "?"
+        my_wind_name = WIND_NAMES.get(self._my_seat, "?")
         self.query_one("#hand-title", Label).update(
-            f"[bold]Your Hand (East)[/bold]  —  Tiles away: {shanten_str}"
-            f"  |  Table: [yellow]{table_wind}[/yellow]"
+            f"[bold]Player {my_player_num} — Your Hand ({my_wind_name})[/bold]  —  Tiles away: {shanten_str}"
             f"  |  Wall: {wall}  Turn: {self._engine.turn_number}"
+            f"  |  [yellow]★{my_chips}[/yellow]"
+        )
+        self.query_one("#table-wind-label", Label).update(
+            f"[bold yellow]Table Wind: {table_wind}[/bold yellow]"
         )
         exposed = _exposed_row(player.hand)
         self.query_one("#meld-display", Static).update(
@@ -777,15 +898,18 @@ class InteractiveScreen(Screen):
     def _update_opponent_panels(self) -> None:
         if self._engine is None:
             return
-        for seat in [int(Wind.NORTH), int(Wind.SOUTH), int(Wind.WEST)]:
+        opp_seats = [s for s in [int(Wind.NORTH), int(Wind.SOUTH), int(Wind.WEST),
+                                   int(Wind.EAST)] if s != self._my_seat]
+        for i, seat in enumerate(opp_seats):
             player = self._engine.players[seat]
             discs = _discards_markup(player.discards)
             exposed = _exposed_row(player.hand)
-            lines: list[str] = []
+            opp_chips = self._engine.chips.get(seat, 0)
+            lines: list[str] = [f"[yellow]★{opp_chips}[/yellow]"]
             if exposed:
                 lines.append(exposed)
             lines.append(f"[dim]Discards:[/dim] {discs if discs else '—'}")
-            self.query_one(f"#opp-disc-{seat}", Static).update("\n".join(lines))
+            self.query_one(f"#opp-disc-{i}", Static).update("\n".join(lines))
 
     @work(thread=True)
     def _compute_recommendations(self) -> None:
@@ -807,6 +931,7 @@ class InteractiveScreen(Screen):
                     s_str,
                     str(r.weighted_acceptance),
                     f"{r.danger_score:.2f}",
+                    f"{r.tai_potential:.1f}",
                     f"{r.utility:.3f}",
                 )
 
@@ -817,7 +942,13 @@ class InteractiveScreen(Screen):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-new":
-            self._new_game()
+            self._new_match()
+        elif event.button.id == "btn-next":
+            self.query_one("#btn-next", Button).disabled = True
+            self._start_hand(
+                f"[bold]{self._match.round_label}, Hand {self._match.hand_number} "
+                f"— you are {WIND_NAMES.get(self._my_seat, '?')}.[/bold]"
+            )
         elif event.button.id == "btn-back":
             self.action_go_back()
         elif event.button.id == "btn-quit":

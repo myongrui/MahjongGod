@@ -311,6 +311,7 @@ def recommend(deep: bool, games: int, log_file: str | None, model_path: str | No
     table.add_column("Tiles in", justify="center", width=8)
     table.add_column("Danger", justify="center", width=7)
     table.add_column("Cost", justify="center", width=6)
+    table.add_column("Tai pot", justify="center", width=7)
     table.add_column("Accepts", width=38)
 
     for i, r in enumerate(results[:8], 1):
@@ -328,6 +329,7 @@ def recommend(deep: bool, games: int, log_file: str | None, model_path: str | No
             str(r.weighted_acceptance),
             f"[{d_color}]{r.danger_score:.2f}[/{d_color}]",
             f"{r.shooting_cost:.1f}",
+            f"{r.tai_potential:.1f}",
             accept_str,
         )
 

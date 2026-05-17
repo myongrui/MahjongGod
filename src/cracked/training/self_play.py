@@ -25,12 +25,15 @@ from cracked.tiles import NTILES, Wind
 from cracked.hand import HandState
 from cracked.game_state import GameState, PlayerView
 from cracked.simulator import (
-    SimHand, _heuristic_discard, _estimate_tai, _payment,
+    SimHand, _heuristic_discard, _estimate_tai, _payment, _MIN_TAI,
 )
+from cracked.optimizer import hand_tai_potential
+from cracked.shanten import shanten
+from cracked.danger import expected_shooting_cost
+from cracked.opponent_model import model_all_opponents
 from cracked.training.features import N_STATE_FEATURES, extract_state_features
 
 _WIND_ORDER = [Wind.EAST, Wind.SOUTH, Wind.WEST, Wind.NORTH]
-_OPP_SEATS = [Wind.SOUTH, Wind.WEST, Wind.NORTH]
 
 HIDDEN_SIZE = 256
 N_LAYERS = 2
@@ -38,6 +41,48 @@ CLIP_EPS = 0.2
 VF_COEF = 0.5
 ENT_COEF = 0.01
 MAX_ROUNDS = 40  # game turn cap (same as simulator)
+SHAPING_SCALE = 1.0  # potential-based reward shaping weight
+DEFENSE_WEIGHT = 0.02  # immediate penalty per step scaled by expected shooting cost
+
+
+def _compute_potential(
+    concealed: np.ndarray,
+    n_melds: int,
+    seat_wind: int,
+    prevailing_wind: int,
+) -> float:
+    """
+    State potential for PBRS (potential-based reward shaping).
+
+    Combines shanten proximity and tai ceiling so the agent receives a
+    dense learning signal at every step rather than only at game end.
+    """
+    s = shanten(concealed, n_melds)
+    shanten_val = (7 - s) / 8.0
+    tai_pot = hand_tai_potential(concealed, [], seat_wind, prevailing_wind)
+    tai_val = min(tai_pot / 6.0, 1.0)
+    return 1.5 * shanten_val + 1.0 * tai_val
+
+
+def _wants_pong(hand: SimHand, tile: int) -> bool:
+    """True if claiming a pong of tile maintains or improves best post-pong shanten."""
+    if hand.concealed[tile] < 2:
+        return False
+    s_before = shanten(hand.concealed, hand.n_melds)
+    hand.concealed[tile] -= 2
+    hand.n_melds += 1
+    best_s = 99
+    for t in range(NTILES):
+        if hand.concealed[t] == 0:
+            continue
+        hand.concealed[t] -= 1
+        s = shanten(hand.concealed, hand.n_melds)
+        hand.concealed[t] += 1
+        if s < best_s:
+            best_s = s
+    hand.concealed[tile] += 2
+    hand.n_melds -= 1
+    return best_s <= s_before
 
 
 def _require_torch():
@@ -99,20 +144,23 @@ def ActorCritic(
     return _ActorCritic()
 
 
-def save_policy(model, path: Path) -> None:
-    """Save ActorCritic weights and hyperparameters."""
+def save_policy(model, path: Path, optimizer=None) -> None:
+    """Save ActorCritic weights, hyperparameters, and optionally optimizer state."""
     torch = _require_torch()
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     trunk_linear = next(m for m in model.trunk.modules()
                         if hasattr(m, "in_features"))
-    torch.save({
+    ckpt = {
         "state_dict": model.state_dict(),
         "n_features": trunk_linear.in_features,
         "hidden": hidden_size(model),
         "n_layers": sum(1 for m in model.trunk.modules()
                         if type(m).__name__ == "_ResBlock"),
-    }, path)
+    }
+    if optimizer is not None:
+        ckpt["optimizer_state"] = optimizer.state_dict()
+    torch.save(ckpt, path)
 
 
 def hidden_size(model) -> int:
@@ -145,13 +193,16 @@ class Step:
     action: int              # tile index discarded
     old_log_prob: float      # log prob under collection policy
     value_pred: float        # value estimate at this state
+    potential: float = 0.0   # state potential φ(s) for PBRS reward shaping
+    discard_reward: float = 0.0  # immediate defense penalty: −DEFENSE_WEIGHT × expected_cost
 
 
 @dataclass
 class Episode:
     """Trajectory collected from one simulated game."""
     steps: list[Step] = field(default_factory=list)
-    terminal_reward: float = 0.0   # my_net from game result
+    terminal_reward: float = 0.0    # my_net from game result
+    final_potential: float = 0.0    # φ(s_T) at terminal state
 
 
 # ---------------------------------------------------------------------------
@@ -185,11 +236,12 @@ def _build_game_state(
     wall_remaining: int,
     turn: int,
     opp_discards: list[list[int]],
+    opp_seats: list[int],
 ) -> GameState:
     """Construct a GameState snapshot for feature extraction."""
     opponents = [
         PlayerView(seat=seat, discards=list(opp_discards[i]))
-        for i, seat in enumerate(_OPP_SEATS)
+        for i, seat in enumerate(opp_seats)
     ]
     return GameState(
         my_hand=HandState(
@@ -213,119 +265,159 @@ def collect_episode(
     rng: random.Random,
     my_seat: int = Wind.EAST,
     prevailing_wind: int = Wind.EAST,
+    shaping_scale: float = SHAPING_SCALE,
+    defense_weight: float = DEFENSE_WEIGHT,
 ) -> Episode:
     """
-    Play one game: learning agent (actor_critic) vs three heuristic opponents.
+    Play one game: learning agent (actor_critic) vs three heuristic AI opponents.
 
-    The learning agent plays as my_seat (default East).
-    Returns an Episode with one Step per discard decision made by our agent.
+    AI opponents will claim pongs when it maintains or improves their shanten.
+    The agent does not auto-pong — it only decides what to discard on its draw.
+    Wall stops at 15 tiles remaining, matching the real game dead-wall rule.
     """
     torch = _require_torch()
     import torch.nn.functional as F
 
-    # Derive torch seed from rng so all randomness is controlled by one seed.
     torch.manual_seed(rng.randint(0, 2**31 - 1))
     my_concealed, opp_concealeds, wall = _deal_fresh_game(rng)
 
-    # SimHand objects hold the ground-truth tile counts (for win checking)
+    _WINDS = [int(Wind.EAST), int(Wind.SOUTH), int(Wind.WEST), int(Wind.NORTH)]
+    opp_seats = [s for s in _WINDS if s != my_seat]
+
     my_sim = SimHand(my_concealed.copy(), 0, my_seat)
-    opp_sims = [
-        SimHand(arr.copy(), 0, seat)
-        for arr, seat in zip(opp_concealeds, _OPP_SEATS)
-    ]
-    all_seats = sorted([my_seat] + list(_OPP_SEATS))
-    sim_by_seat = {my_seat: my_sim}
+    opp_sims = [SimHand(arr.copy(), 0, seat) for arr, seat in zip(opp_concealeds, opp_seats)]
+    all_seats = sorted([my_seat] + opp_seats)
+    sim_by_seat: dict[int, SimHand] = {my_seat: my_sim}
     for h in opp_sims:
         sim_by_seat[h.seat] = h
 
-    # Tracked from our perspective (for feature extraction)
     my_hand = my_concealed.copy()
-    opp_discards: list[list[int]] = [[], [], []]   # indexed by opp order in _OPP_SEATS
-    opp_seat_to_idx = {seat: i for i, seat in enumerate(_OPP_SEATS)}
+    opp_discards: list[list[int]] = [[], [], []]
+    opp_seat_to_idx = {seat: i for i, seat in enumerate(opp_seats)}
 
     episode = Episode()
     wall_idx = 0
     wall_remaining = len(wall)
     turn = 0
+    n = len(all_seats)
 
-    for _ in range(MAX_ROUNDS):
-        for seat in all_seats:
-            if wall_idx >= len(wall):
-                return episode  # wall exhausted — draw
+    def _finalize() -> Episode:
+        episode.final_potential = _compute_potential(my_hand, 0, my_seat, prevailing_wind)
+        return episode
 
-            drawn = wall[wall_idx]
-            wall_idx += 1
-            wall_remaining -= 1
-            turn += 1
-            sim_by_seat[seat].concealed[drawn] += 1
-            if seat == my_seat:
-                my_hand[drawn] += 1
-
-            # Self-draw win check
-            h = sim_by_seat[seat]
-            if h.is_winner():
-                tai = _estimate_tai(h.concealed, h.n_melds)
-                pay = _payment(tai)
-                if seat == my_seat:
-                    episode.terminal_reward = pay * 3.0
-                else:
-                    episode.terminal_reward = -pay
-                return episode
-
-            # Choose discard
-            if seat == my_seat:
-                state_snap = _build_game_state(
-                    my_hand, my_seat, prevailing_wind,
-                    wall_remaining, turn, opp_discards,
-                )
-                state_feat = extract_state_features(state_snap)
-                feat_t = torch.tensor(state_feat, dtype=torch.float32).unsqueeze(0)
-
-                with torch.no_grad():
-                    logits, value_t = actor_critic(feat_t)
-
-                logits = logits.squeeze(0)
-                value = value_t.squeeze(0).item()
-
-                # Mask tiles not in hand
-                valid = torch.zeros(NTILES, dtype=torch.bool)
-                for t in range(NTILES):
-                    if my_hand[t] > 0:
-                        valid[t] = True
-                logits[~valid] = -1e9
-
-                log_probs = F.log_softmax(logits, dim=-1)
-                probs = log_probs.exp()
-                action = torch.multinomial(probs, 1).item()
-                old_log_prob = log_probs[action].item()
-
-                episode.steps.append(Step(state_feat, action, old_log_prob, value))
-                discard = action
-                my_hand[discard] -= 1
-            else:
-                discard = _heuristic_discard(h)
-
-            h.concealed[discard] -= 1
-            if seat != my_seat:
-                opp_discards[opp_seat_to_idx[seat]].append(discard)
-
-            # Ron win check (any other player claims the discard)
-            for claimer_seat in all_seats:
-                if claimer_seat == seat:
+    def _check_ron(discarder: int, discard: int) -> bool:
+        """Ron check after a discard. Sets terminal_reward and returns True if game over."""
+        for claimer_seat in all_seats:
+            if claimer_seat == discarder:
+                continue
+            if sim_by_seat[claimer_seat].can_win_from(discard):
+                tai = _estimate_tai(sim_by_seat[claimer_seat].concealed, sim_by_seat[claimer_seat].n_melds)
+                if tai < _MIN_TAI:
                     continue
-                if sim_by_seat[claimer_seat].can_win_from(discard):
-                    tai = _estimate_tai(
-                        sim_by_seat[claimer_seat].concealed,
-                        sim_by_seat[claimer_seat].n_melds,
-                    )
-                    pay = _payment(tai)
-                    if seat == my_seat:
-                        episode.terminal_reward = -pay * 3.0
-                    elif claimer_seat == my_seat:
-                        episode.terminal_reward = pay * 3.0
-                    return episode
+                pay = _payment(tai)
+                if discarder == my_seat:
+                    episode.terminal_reward = -pay * 3.0
+                elif claimer_seat == my_seat:
+                    episode.terminal_reward = pay * 3.0
+                return True
+        return False
 
-    return episode  # max rounds reached — draw
+    def _find_pong_claimer(discarder: int, discard: int) -> Optional[int]:
+        """First AI seat (in order) willing to pong the discard. Agent never auto-pongs."""
+        for cs in all_seats:
+            if cs == discarder or cs == my_seat:
+                continue
+            if _wants_pong(sim_by_seat[cs], discard):
+                return cs
+        return None
+
+    # East always draws first; all_seats is sorted so index 0 = East
+    seat_cursor = 0
+
+    for _ in range(MAX_ROUNDS * n * 2):  # generous upper cap
+        # Dead-wall check: stop drawing when 15 tiles remain
+        if wall_remaining <= 15:
+            return _finalize()
+
+        seat = all_seats[seat_cursor % n]
+        drawn = wall[wall_idx]
+        wall_idx += 1
+        wall_remaining -= 1
+        turn += 1
+        sim_by_seat[seat].concealed[drawn] += 1
+        if seat == my_seat:
+            my_hand[drawn] += 1
+
+        h = sim_by_seat[seat]
+
+        # Self-draw win check
+        if h.is_winner():
+            tai = _estimate_tai(h.concealed, h.n_melds)
+            if tai >= _MIN_TAI:
+                pay = _payment(tai)
+                episode.terminal_reward = pay * 3.0 if seat == my_seat else -pay
+                return _finalize()
+
+        # Discard: agent uses policy, AI uses heuristic
+        if seat == my_seat:
+            state_snap = _build_game_state(
+                my_hand, my_seat, prevailing_wind, wall_remaining, turn, opp_discards, opp_seats,
+            )
+            state_feat = extract_state_features(state_snap)
+            feat_t = torch.tensor(state_feat, dtype=torch.float32).unsqueeze(0)
+
+            with torch.no_grad():
+                logits, value_t = actor_critic(feat_t)
+
+            logits = logits.squeeze(0)
+            value = value_t.squeeze(0).item()
+
+            valid = torch.zeros(NTILES, dtype=torch.bool)
+            for t in range(NTILES):
+                if my_hand[t] > 0:
+                    valid[t] = True
+            logits[~valid] = -1e9
+
+            log_probs = F.log_softmax(logits, dim=-1)
+            probs = log_probs.exp()
+            action = torch.multinomial(probs, 1).item()
+            old_log_prob = log_probs[action].item()
+
+            discard = action
+            my_hand[discard] -= 1
+            h.concealed[discard] -= 1
+
+            pot = _compute_potential(my_hand, 0, my_seat, prevailing_wind)
+            opp_models = model_all_opponents(state_snap)
+            cost = expected_shooting_cost(discard, state_snap, opp_models)
+            dr = -defense_weight * cost
+            episode.steps.append(Step(state_feat, action, old_log_prob, value, pot, dr))
+        else:
+            discard = _heuristic_discard(h)
+            h.concealed[discard] -= 1
+            opp_discards[opp_seat_to_idx[seat]].append(discard)
+
+        # Ron check
+        if _check_ron(seat, discard):
+            return _finalize()
+
+        # Pong check: AI opponents only
+        pong_seat = _find_pong_claimer(seat, discard)
+        if pong_seat is not None:
+            ph = sim_by_seat[pong_seat]
+            ph.concealed[discard] -= 2
+            ph.n_melds += 1
+            pong_discard = _heuristic_discard(ph)
+            ph.concealed[pong_discard] -= 1
+            opp_discards[opp_seat_to_idx[pong_seat]].append(pong_discard)
+            if _check_ron(pong_seat, pong_discard):
+                return _finalize()
+            # Next to draw: seat after the pong claimer
+            seat_cursor = all_seats.index(pong_seat) + 1
+        else:
+            seat_cursor += 1
+
+    return _finalize()
 
 
 # ---------------------------------------------------------------------------
@@ -340,26 +432,42 @@ def ppo_update(
     vf_coef: float = VF_COEF,
     ent_coef: float = ENT_COEF,
     ppo_epochs: int = 4,
+    shaping_scale: float = SHAPING_SCALE,
 ) -> dict:
     """
     One PPO update pass over a batch of episodes.
+
+    Return for step t combines three signals:
+      1. Terminal reward: game outcome (win/shoot/draw).
+      2. PBRS: scale × (φ(s_T) − φ(s_t)) — rewards building toward tenpai
+         and high-value hands.
+      3. Cumulative future defense penalties: sum of discard_reward from step t
+         onward — penalizes dangerous discards by their expected shooting cost.
 
     Returns a dict with scalar loss metrics.
     """
     torch = _require_torch()
     import torch.nn.functional as F
 
-    # Flatten all steps across episodes; each step gets the same terminal reward
     all_states, all_actions, all_old_lp, all_returns = [], [], [], []
     for ep in episodes:
         if not ep.steps:
             continue
         G = ep.terminal_reward
-        for step in ep.steps:
+        # Cumulative future defense rewards: step i includes sum of
+        # discard_reward from i onward so earlier steps share later penalties.
+        n = len(ep.steps)
+        cum_dr = [0.0] * n
+        acc = 0.0
+        for i in range(n - 1, -1, -1):
+            acc += ep.steps[i].discard_reward
+            cum_dr[i] = acc
+        for i, step in enumerate(ep.steps):
+            shaped = G + cum_dr[i] + shaping_scale * (ep.final_potential - step.potential)
             all_states.append(step.state_feat)
             all_actions.append(step.action)
             all_old_lp.append(step.old_log_prob)
-            all_returns.append(G)
+            all_returns.append(shaped)
 
     if not all_states:
         return {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
@@ -369,10 +477,6 @@ def ppo_update(
     old_lp_t = torch.tensor(all_old_lp, dtype=torch.float32)
     returns_t = torch.tensor(all_returns, dtype=torch.float32)
 
-    # Normalise returns for more stable gradients
-    if len(returns_t) > 1:
-        returns_t = (returns_t - returns_t.mean()) / (returns_t.std() + 1e-8)
-
     total_pl = total_vl = total_ent = 0.0
     for _ in range(ppo_epochs):
         logits, values = actor_critic(states_t)
@@ -380,7 +484,11 @@ def ppo_update(
         log_probs_all = F.log_softmax(logits, dim=-1)
         new_lp = log_probs_all.gather(1, actions_t.unsqueeze(1)).squeeze(1)
 
-        advantages = (returns_t - values.detach())
+        # Normalise advantages (not returns) so the sign of terminal reward is preserved
+        # for the value head, while the policy gradient still gets stable gradients.
+        advantages = returns_t - values.detach()
+        if len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         ratio = (new_lp - old_lp_t).exp()
         clipped = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
         policy_loss = -torch.min(ratio * advantages, clipped * advantages).mean()
@@ -422,11 +530,13 @@ def evaluate_vs_heuristic(
     Returns {win_rate, shoot_rate, draw_rate, mean_net}.
     """
     rng = random.Random(seed)
+    _WINDS = [int(Wind.EAST), int(Wind.SOUTH), int(Wind.WEST), int(Wind.NORTH)]
     win = shoot = draw = 0
     total_net = 0.0
 
-    for _ in range(n_games):
-        ep = collect_episode(actor_critic, rng, my_seat, prevailing_wind)
+    for i in range(n_games):
+        ep_seat = _WINDS[i % 4]  # rotate evenly across all seats
+        ep = collect_episode(actor_critic, rng, ep_seat, prevailing_wind)
         r = ep.terminal_reward
         total_net += r
         if r > 0:
@@ -457,11 +567,18 @@ def train_self_play(
     verbose: bool = True,
     eval_every: int = 500,
     eval_games: int = 200,
+    shaping_scale: float = SHAPING_SCALE,
+    defense_weight: float = DEFENSE_WEIGHT,
+    resume: bool = False,
 ) -> None:
     """
     Train ActorCritic via self-play against heuristic opponents.
 
+    Uses potential-based reward shaping (PBRS) derived from shanten
+    proximity and tai-potential to give the agent dense learning signal.
+
     Saves the best checkpoint (by mean_net in evaluation) to model_path.
+    Pass resume=True to continue from an existing checkpoint at model_path.
     Raises ImportError if torch is not installed.
     """
     torch = _require_torch()
@@ -472,17 +589,37 @@ def train_self_play(
     model = ActorCritic()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
+    if resume and Path(model_path).exists():
+        ckpt = torch.load(Path(model_path), map_location="cpu", weights_only=True)
+        model.load_state_dict(ckpt["state_dict"])
+        if "optimizer_state" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+        if verbose:
+            print(f"Resumed from {model_path}")
+
     best_mean_net = float("-inf")
     episode_buffer: list[Episode] = []
 
     if verbose:
-        print(f"Training for {n_episodes} episodes, batch={episodes_per_update}")
+        print(
+            f"Training for {n_episodes} episodes, "
+            f"batch={episodes_per_update}, shaping={shaping_scale}, "
+            f"defense={defense_weight}"
+        )
+
+    _WINDS = [int(Wind.EAST), int(Wind.SOUTH), int(Wind.WEST), int(Wind.NORTH)]
 
     for ep_num in range(1, n_episodes + 1):
-        episode_buffer.append(collect_episode(model, rng))
+        ep_seat = rng.choice(_WINDS)  # train from all seats equally
+        episode_buffer.append(
+            collect_episode(model, rng, my_seat=ep_seat, shaping_scale=shaping_scale,
+                            defense_weight=defense_weight)
+        )
 
         if len(episode_buffer) >= episodes_per_update:
-            metrics = ppo_update(model, optimizer, episode_buffer)
+            metrics = ppo_update(
+                model, optimizer, episode_buffer, shaping_scale=shaping_scale
+            )
             episode_buffer.clear()
 
             if verbose and ep_num % 200 == 0:
@@ -506,7 +643,7 @@ def train_self_play(
                 )
             if stats["mean_net"] > best_mean_net:
                 best_mean_net = stats["mean_net"]
-                save_policy(model, model_path)
+                save_policy(model, model_path, optimizer)
                 if verbose:
                     print(f"  → new best ({best_mean_net:+.3f}), saved to {model_path}")
 
@@ -524,6 +661,12 @@ def _cli():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--eval-every", type=int, default=500)
     parser.add_argument("--eval-games", type=int, default=200)
+    parser.add_argument("--shaping-scale", type=float, default=SHAPING_SCALE,
+                        help="PBRS reward shaping weight (0 = off)")
+    parser.add_argument("--defense-weight", type=float, default=DEFENSE_WEIGHT,
+                        help="Defense penalty weight per step (0 = off)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Continue training from existing checkpoint at --out path")
     args = parser.parse_args()
     train_self_play(
         n_episodes=args.episodes,
@@ -533,6 +676,9 @@ def _cli():
         seed=args.seed,
         eval_every=args.eval_every,
         eval_games=args.eval_games,
+        shaping_scale=args.shaping_scale,
+        defense_weight=args.defense_weight,
+        resume=args.resume,
     )
 
 

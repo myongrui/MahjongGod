@@ -29,12 +29,35 @@ from cracked.hand import HandState, Meld, MeldType
 @dataclass
 class HouseRules:
     tai_cap: int = 5
-    min_tai: int = 1 
+    min_tai: int = 1
     seven_pairs_base: int = 3       # some houses use 2
     flowers_above_cap: bool = False  # flower/season tai added after cap is applied
 
 
 DEFAULT_RULES = HouseRules()
+
+
+# ---------------------------------------------------------------------------
+# Chip payment system
+# ---------------------------------------------------------------------------
+
+STARTING_CHIPS: int = 500
+
+# Shooter scale:  4 / 8 / 16 / 32 / 64  (tai 1–5)
+# Zimo per player: 2 / 4 /  8 / 16 / 32  (tai 1–5)
+_SHOOTER_BASE = 4
+_ZIMO_BASE = 2
+
+
+def chip_payment(tai: int) -> tuple[int, int]:
+    """
+    Returns (shooter_pay, zimo_pay_per_player) for the given tai level.
+
+    shooter_pay         — what the discarder pays to the winner (ron)
+    zimo_pay_per_player — what each opponent pays for a self-draw win
+    """
+    multiplier = 1 << max(tai - 1, 0)
+    return _SHOOTER_BASE * multiplier, _ZIMO_BASE * multiplier
 
 
 # ---------------------------------------------------------------------------

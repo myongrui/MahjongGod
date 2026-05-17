@@ -6,7 +6,10 @@ import pytest
 from cracked.tiles import tile_id, Wind, tiles_from_names
 from cracked.hand import HandState
 from cracked.game_state import GameState, PlayerView
-from cracked.training.features import extract_features, N_FEATURES
+from cracked.training.features import (
+    extract_features, N_FEATURES,
+    _STATE_BLOCK_SIZE, _OPP_BLOCK_SIZE,
+)
 
 
 def _make_state(my_seat=Wind.EAST, prevailing=Wind.EAST) -> GameState:
@@ -63,7 +66,7 @@ def test_feature_deterministic():
 
 
 # ---------------------------------------------------------------------------
-# Candidate discard one-hot (indices 82–115)
+# Candidate discard one-hot (indices _STATE_BLOCK_SIZE .. +33)
 # ---------------------------------------------------------------------------
 
 def test_candidate_discard_onehot_set():
@@ -71,7 +74,7 @@ def test_candidate_discard_onehot_set():
     _set_hand(state, *_FULL_HAND)
     tid = tile_id("gd")
     feat = extract_features(state, tid)
-    assert feat[82 + tid] == pytest.approx(1.0)
+    assert feat[_STATE_BLOCK_SIZE + tid] == pytest.approx(1.0)
 
 
 def test_candidate_discard_onehot_exclusive():
@@ -81,7 +84,7 @@ def test_candidate_discard_onehot_exclusive():
     feat = extract_features(state, tid)
     for t in range(34):
         if t != tid:
-            assert feat[82 + t] == pytest.approx(0.0)
+            assert feat[_STATE_BLOCK_SIZE + t] == pytest.approx(0.0)
 
 
 def test_different_discards_give_different_features():
@@ -148,27 +151,31 @@ def test_concealed_quad_normalized():
 
 
 # ---------------------------------------------------------------------------
-# Shanten after discard (index 116)
+# Shanten after discard (index _STATE_BLOCK_SIZE + 34)
 # ---------------------------------------------------------------------------
+
+_SHANTEN_IDX = _STATE_BLOCK_SIZE + 34
 
 def test_shanten_after_tenpai_discard():
     # Discarding gd from this hand leaves shanten=0 → (0+1)/9
     state = _make_state()
     _set_hand(state, *_FULL_HAND)
     feat = extract_features(state, tile_id("gd"))
-    assert feat[116] == pytest.approx(1.0 / 9.0, abs=1e-5)
+    assert feat[_SHANTEN_IDX] == pytest.approx(1.0 / 9.0, abs=1e-5)
 
 
 def test_shanten_after_is_nonnegative():
     state = _make_state()
     _set_hand(state, *_FULL_HAND)
     feat = extract_features(state, tile_id("rd"))
-    assert feat[116] >= 0.0
+    assert feat[_SHANTEN_IDX] >= 0.0
 
 
 # ---------------------------------------------------------------------------
-# Opponent encoding (indices 117+)
+# Opponent encoding (starts at _STATE_BLOCK_SIZE + 35)
 # ---------------------------------------------------------------------------
+
+_OPP_BASE = _STATE_BLOCK_SIZE + 35
 
 def test_opponent_discard_reflected_in_features():
     state = _make_state()
@@ -176,9 +183,9 @@ def test_opponent_discard_reflected_in_features():
     opp = state.opponent_by_seat(Wind.SOUTH)
     opp.discards = [tile_id("b5"), tile_id("b5")]  # 2 copies
     feat = extract_features(state, tile_id("gd"))
-    # South is the first opponent (index 0) → base 117; discards start at +5
+    # South is the first opponent (index 0); discards start at +5
     b5_id = tile_id("b5")
-    assert feat[117 + 5 + b5_id] == pytest.approx(2.0 / 4.0)
+    assert feat[_OPP_BASE + 5 + b5_id] == pytest.approx(2.0 / 4.0)
 
 
 def test_opponent_tenpai_prob_encoded():
@@ -193,9 +200,9 @@ def test_opponent_tenpai_prob_encoded():
     feat_high = extract_features(state2, tile_id("gd"))
 
     # tenpai_prob at base+39; higher turn → higher prob
-    assert feat_high[117 + 39] >= feat_low[117 + 39]
+    assert feat_high[_OPP_BASE + 39] >= feat_low[_OPP_BASE + 39]
 
 
 def test_n_features_constant_matches_computed():
-    """Verify N_FEATURES equals 82 + 35 + 3×45 = 252."""
-    assert N_FEATURES == 82 + 35 + 3 * 45
+    """Verify N_FEATURES equals 89 + 35 + 3×47 = 265."""
+    assert N_FEATURES == _STATE_BLOCK_SIZE + 35 + 3 * _OPP_BLOCK_SIZE

@@ -72,7 +72,8 @@ def test_state_features_differ_by_turn():
 
 
 def test_n_state_features_constant():
-    assert N_STATE_FEATURES == 82 + 3 * 45
+    from cracked.training.features import _STATE_BLOCK_SIZE, _OPP_BLOCK_SIZE
+    assert N_STATE_FEATURES == _STATE_BLOCK_SIZE + 3 * _OPP_BLOCK_SIZE
 
 
 # ---------------------------------------------------------------------------

@@ -175,10 +175,11 @@ python -m cracked.training.self_play \
     --episodes 5000 \
     --out models/policy.pt \
     --eval-every 500 \
-    --eval-games 200
+    --eval-games 200 \
+    --resume   # continue from existing checkpoint
 ```
 
-The policy plays as East against three heuristic opponents. Checkpoints are saved whenever evaluation improves.
+The policy trains from all four seat positions (East/South/West/North) against three heuristic opponents that claim pongs during simulation. Wall stops at 15 tiles remaining, matching real game rules. Checkpoints are saved whenever evaluation improves.
 
 ---
 

@@ -82,7 +82,9 @@ def _estimate_tai(opp: PlayerView, suit_bias: Optional[int], prevailing_wind: in
         if DRAGON_START <= t < DRAGON_END:
             tai += 1.0
         elif WIND_START <= t < WIND_END:
-            if t == prevailing_wind or t == opp.seat:
+            if t == prevailing_wind:
+                tai += 1.0
+            if t == opp.seat:
                 tai += 1.0
 
     # Flush signal: all melds one suit with a suit bias
@@ -107,33 +109,143 @@ def _adjacent_to_melds(tid: int, melds: list) -> bool:
     return False
 
 
+def _dragon_danger_flags(
+    opp: PlayerView,
+    visible: np.ndarray,
+) -> tuple[set[int], set[int]]:
+    """
+    Return (extra_dangerous, extra_safe) sets for dragon tiles.
+
+    extra_safe:
+      The 4th copy of a ponged/konged dragon — claiming it only grants a kong
+      replacement draw, not a win.
+
+    extra_dangerous (requires 4+ discards before drawing conclusions):
+      - Opponent has discarded no dragons: they are holding all three
+        intentionally; every undiscarded dragon is a potential pair/triplet wait.
+      - Opponent has a visible dragon pong/kong: hints at a three-dragon hand;
+        other undiscarded, non-ponged dragons become suspicious.
+    """
+    discarded_set = set(opp.discards)
+
+    ponged_dragons: set[int] = {
+        m.tiles[0]
+        for m in opp.melds
+        if DRAGON_START <= m.tiles[0] < DRAGON_END
+        and m.type.value in ("pong", "kong")
+    }
+
+    dragon_discard_count = sum(
+        1 for d in range(DRAGON_START, DRAGON_END) if d in discarded_set
+    )
+    undiscarded_free = [
+        d for d in range(DRAGON_START, DRAGON_END)
+        if d not in discarded_set and int(visible[d]) < 4 and d not in ponged_dragons
+    ]
+
+    extra_safe: set[int] = set(ponged_dragons)
+    extra_dangerous: set[int] = set()
+
+    if len(opp.discards) < 4:
+        return extra_dangerous, extra_safe
+
+    if dragon_discard_count == 0:
+        extra_dangerous.update(undiscarded_free)
+
+    if ponged_dragons:
+        extra_dangerous.update(undiscarded_free)
+
+    return extra_dangerous, extra_safe
+
+
+def _wind_danger_flags(
+    opp: PlayerView,
+    visible: np.ndarray,
+    prevailing_wind: int,
+    honor_bias: bool,
+) -> tuple[set[int], set[int]]:
+    """
+    Return (extra_dangerous, extra_safe) sets for wind tiles.
+
+    extra_safe:
+      4th copy of a ponged/konged wind — cannot complete a win for them.
+
+    extra_dangerous (requires 4+ discards):
+      - Seat wind or prevailing wind not discarded: likely held for tai value.
+      - honor_bias is True (6+ discards, zero honors thrown): opponent is
+        hoarding honors broadly; all un-discarded winds are suspicious.
+      - Visible wind pong: hints at an honor-collecting hand; other un-discarded
+        winds escalate.
+    """
+    discarded_set = set(opp.discards)
+
+    ponged_winds: set[int] = {
+        m.tiles[0]
+        for m in opp.melds
+        if WIND_START <= m.tiles[0] < WIND_END
+        and m.type.value in ("pong", "kong")
+    }
+
+    extra_safe: set[int] = set(ponged_winds)
+    extra_dangerous: set[int] = set()
+
+    if len(opp.discards) < 4:
+        return extra_dangerous, extra_safe
+
+    def _free_wind(w: int) -> bool:
+        return w not in discarded_set and int(visible[w]) < 4 and w not in ponged_winds
+
+    # Seat wind / prevailing wind kept this long → probably holding for tai
+    for w in {opp.seat, prevailing_wind}:
+        if WIND_START <= w < WIND_END and _free_wind(w):
+            extra_dangerous.add(w)
+
+    # No honors thrown at all → collecting honors broadly
+    if honor_bias:
+        for w in range(WIND_START, WIND_END):
+            if _free_wind(w):
+                extra_dangerous.add(w)
+
+    # Visible wind pong → honor-collecting hand likely; other winds suspicious
+    if ponged_winds:
+        for w in range(WIND_START, WIND_END):
+            if _free_wind(w):
+                extra_dangerous.add(w)
+
+    return extra_dangerous, extra_safe
+
+
 def _compute_tile_sets(
     opp: PlayerView,
     suit_bias: Optional[int],
     visible: np.ndarray,
+    prevailing_wind: int,
+    honor_bias: bool,
 ) -> tuple[set[int], set[int]]:
     """Compute (dangerous, safe) tile sets for one opponent."""
     dangerous: set[int] = set()
     safe: set[int] = set()
     discarded = set(opp.discards)
 
+    dragon_dangerous, dragon_safe = _dragon_danger_flags(opp, visible)
+    wind_dangerous, wind_safe = _wind_danger_flags(opp, visible, prevailing_wind, honor_bias)
+
     for tid in range(NTILES):
-        # All 4 copies visible → exhausted, definitely safe
         if visible[tid] >= 4:
             safe.add(tid)
             continue
-
-        # Opponent already discarded this tile → they don't want it now
         if tid in discarded:
             safe.add(tid)
             continue
-
-        # In opponent's suspected flush suit → dangerous
+        if tid in dragon_safe or tid in wind_safe:
+            safe.add(tid)
+            continue
+        if tid in dragon_dangerous or tid in wind_dangerous:
+            dangerous.add(tid)
+            continue
         if suit_bias is not None and is_suited(tid) and suit_of(tid) == suit_bias:
             dangerous.add(tid)
             continue
-
-        # Adjacent to an exposed meld → possible sequence wait in concealed hand
         if _adjacent_to_melds(tid, opp.melds):
             dangerous.add(tid)
 
@@ -144,7 +256,9 @@ def model_opponent(opp: PlayerView, state: GameState) -> OpponentModel:
     """Build an OpponentModel from the current observable game state."""
     visible = state.visible_tiles()
     suit_bias, honor_bias = detect_suit_bias(opp)
-    dangerous, safe = _compute_tile_sets(opp, suit_bias, visible)
+    dangerous, safe = _compute_tile_sets(
+        opp, suit_bias, visible, state.prevailing_wind, honor_bias
+    )
     tp = tenpai_probability(len(opp.melds), state.turn_number)
     est_tai = _estimate_tai(opp, suit_bias, state.prevailing_wind)
 

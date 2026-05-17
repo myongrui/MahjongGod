@@ -145,7 +145,7 @@ class CrackedMahjongApp(App):
 
     def on_mount(self) -> None:
         rec = self.query_one("#rec-table", DataTable)
-        rec.add_columns("#", "Discard", "Tiles away", "Accepts", "Danger", "Cost", "Utility")
+        rec.add_columns("#", "Discard", "Tiles away", "Accepts", "Danger", "Cost", "Tai pot", "Utility")
         rec.cursor_type = "none"
 
         sim = self.query_one("#sim-table", DataTable)
@@ -256,6 +256,7 @@ class CrackedMahjongApp(App):
                 str(r.weighted_acceptance),
                 f"{r.danger_score:.2f}",
                 f"{r.shooting_cost:.2f}",
+                f"{r.tai_potential:.1f}",
                 f"{r.utility:.3f}",
             )
 

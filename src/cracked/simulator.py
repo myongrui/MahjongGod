@@ -22,6 +22,8 @@ from cracked.tiles import NTILES, is_suited, is_honor, suit_of, DRAGON_START, DR
 from cracked.game_state import GameState
 from cracked.shanten import shanten
 
+_MIN_TAI = 1  # minimum tai required to declare a win
+
 
 # ---------------------------------------------------------------------------
 # Lightweight simulation structures
@@ -214,11 +216,12 @@ def _play_one_game(
             # Self-draw win check
             if h.is_winner():
                 tai = _estimate_tai(h.concealed, h.n_melds)
-                pay = _payment(tai)
-                if seat == my_seat:
-                    return GameResult(seat, True, None, tai, pay * 3.0)
-                else:
-                    return GameResult(seat, True, None, tai, -pay)
+                if tai >= _MIN_TAI:
+                    pay = _payment(tai)
+                    if seat == my_seat:
+                        return GameResult(seat, True, None, tai, pay * 3.0)
+                    else:
+                        return GameResult(seat, True, None, tai, -pay)
 
             # Discard
             discard = _heuristic_discard(h)
@@ -231,6 +234,8 @@ def _play_one_game(
                 claimer = hands[claimer_seat]
                 if claimer.can_win_from(discard):
                     tai = _estimate_tai(claimer.concealed, claimer.n_melds)
+                    if tai < _MIN_TAI:
+                        continue
                     pay = _payment(tai)
                     if seat == my_seat:
                         # We shot: shooter pays all (3 losers)

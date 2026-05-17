@@ -94,7 +94,7 @@ Key correctness invariant: **isolated honor tiles (count=1) contribute 0 to the 
 4. Adds flower/season tai on top of the cap (configurable)
 
 `WinContext` carries win circumstances (self-draw, last tile, robbing kong, prevailing wind).
-`HouseRules` is configurable: tai cap (default 5), minimum tai (default 3), seven-pairs base (2 or 3), flower-above-cap flag.
+`HouseRules` is configurable: tai cap (default 5), minimum tai (default 1), seven-pairs base (2 or 3), flower-above-cap flag.
 
 Key scoring elements: dragon pongs (1 each), wind pongs (1 each, +1 if double wind), all pongs (2), half flush (2), full flush (4), small three dragons (3), seven pairs (3 base), limit hands (cap).
 
@@ -168,16 +168,29 @@ CLI tests use Click's `CliRunner` with `monkeypatch` to isolate state files — 
 ```
 tiles → hand → shanten → scoring → game_state → danger → opponent_model → optimizer → cli
                                                                         ↘ simulator ↗
-                                                          optimizer + simulator → engine → tui_game
+                                                          optimizer + simulator → engine → match → tui_game
                                                                         optimizer → tui
                                               training/features → training/model → training/trainer
                                               training/features → training/self_play
 ```
 
+### Match Manager (`src/cracked/match.py`)
+
+`GameMatch` wraps `GameEngine` to manage a full multi-hand Singapore Mahjong match:
+- Chip balances (500 starting) persist across hands — injected into `GameEngine` after `deal()` to override its reset
+- Seat rotation: South→East (new dealer), East→North, North→West, West→South when a non-East player wins
+- No rotation on East win or wall-exhausted draw, UNLESS a kong was declared during the hand (`engine.kong_declared`)
+- After 4 rotations the table wind advances E→S→W→N; match ends after `n_rounds` table-wind rounds (default 4)
+- `player_at: dict[int, int]` maps current wind constant → persistent player number (1–4); rotates with winds
+
+Chip payment scale: shooter pays 4/8/16/32/64 chips; zimo (self-draw) each opponent pays 2/4/8/16/32 chips (tai 1–5).
+
 ### Singapore Mahjong Specifics
 
-- Minimum 3 tai to win
+- Minimum **1** tai to win (not 3)
 - Shooter-pays-all: the player who discards the winning tile pays all losers
 - Tai scoring is exponential (payment = base × 2^tai), making high-tai hands disproportionately dangerous
 - Chow only from the player to your left
 - Seven pairs is a valid winning form
+- Wall stops at **15 tiles remaining** (dead wall) — drawing stops there, not at 0
+- Kong during a hand sets `engine.kong_declared = True`; if wall then exhausts, seats rotate (unlike a normal draw)

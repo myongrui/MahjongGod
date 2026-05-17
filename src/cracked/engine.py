@@ -25,6 +25,7 @@ from cracked.tiles import NTILES, Wind, tile_name, is_bonus_tile, is_animal
 from cracked.hand import HandState, Meld, MeldType
 from cracked.game_state import GameState, PlayerView
 from cracked.shanten import shanten
+from cracked.scoring import calculate_tai, WinContext, chip_payment, STARTING_CHIPS
 from cracked.simulator import SimHand, _heuristic_discard
 from cracked.optimizer import recommend_discard, DiscardRecommendation
 
@@ -82,12 +83,14 @@ class GameEngine:
         self._rng = random.Random(seed)
 
         self.players: dict[int, PlayerState] = {}
+        self.chips: dict[int, int] = {}
         self._wall: list[int] = []
         self._wall_idx: int = 0
         self.turn_number: int = 0
         self._seat_idx: int = 0
         self._phase: str = "not_started"
         self.winner: Optional[int] = None
+        self.kong_declared: bool = False
         self._awaiting_discard: bool = False
 
     # ------------------------------------------------------------------
@@ -140,6 +143,7 @@ class GameEngine:
                 seat=seat, hand=hand, is_human=(seat in self._human_seats)
             )
 
+        self.chips = {seat: STARTING_CHIPS for seat in _WIND_ORDER}
         self._phase = "playing"
         self._seat_idx = 0
         self.turn_number = 0
@@ -175,10 +179,20 @@ class GameEngine:
         drawn = next(e.tile for e in reversed(draw_events) if e.type == EventType.DRAW)
 
         if shanten(player.hand.concealed, len(player.hand.melds)) == -1:
-            self._phase = "finished"
-            self.winner = seat
-            events.append(GameEvent(EventType.WIN_SELF_DRAW, seat=seat, tile=drawn))
-            return events
+            ctx = WinContext(winning_tile=drawn, is_self_draw=True,
+                             is_last_tile=self.wall_remaining <= 15)
+            tai_result = calculate_tai(player.hand, ctx)
+            if tai_result.is_valid_win():
+                _, zimo_pay = chip_payment(tai_result.total)
+                for other in _WIND_ORDER:
+                    if other != seat:
+                        self.chips[other] -= zimo_pay
+                        self.chips[seat] += zimo_pay
+                self._phase = "finished"
+                self.winner = seat
+                events.append(GameEvent(EventType.WIN_SELF_DRAW, seat=seat, tile=drawn,
+                                        detail={"tai": tai_result.total, "zimo_pay": zimo_pay}))
+                return events
 
         if player.is_human:
             self._awaiting_discard = True
@@ -233,7 +247,7 @@ class GameEngine:
         events: list[GameEvent] = []
         player = self.players[seat]
 
-        while self._wall_idx < len(self._wall):
+        while self.wall_remaining > 15:
             tid = self._wall[self._wall_idx]
             self._wall_idx += 1
 
@@ -244,7 +258,7 @@ class GameEngine:
                     player.hand.flowers.append(tid)
                 events.append(GameEvent(EventType.BONUS, seat=seat, tile=tid,
                                         detail={"wall_remaining": self.wall_remaining}))
-                continue  # draw replacement
+                continue  # draw replacement from live wall only
 
             player.hand.add_tile(tid)
             self.turn_number += 1
@@ -280,13 +294,21 @@ class GameEngine:
                 continue
             claimer = self.players[claimer_seat]
             claimer.hand.concealed[tid] += 1
-            wins = shanten(claimer.hand.concealed, len(claimer.hand.melds)) == -1
+            tai_result = None
+            if shanten(claimer.hand.concealed, len(claimer.hand.melds)) == -1:
+                ctx = WinContext(winning_tile=tid, is_self_draw=False,
+                                 is_last_tile=self.wall_remaining <= 15)
+                tai_result = calculate_tai(claimer.hand, ctx)
             claimer.hand.concealed[tid] -= 1
-            if wins:
+            if tai_result is not None and tai_result.is_valid_win():
+                shooter_pay, _ = chip_payment(tai_result.total)
+                self.chips[seat] -= shooter_pay
+                self.chips[claimer_seat] += shooter_pay
                 self._phase = "finished"
                 self.winner = claimer_seat
                 events.append(GameEvent(EventType.WIN_DISCARD, seat=claimer_seat, tile=tid,
-                                        detail={"shooter": seat}))
+                                        detail={"shooter": seat, "tai": tai_result.total,
+                                                "shooter_pay": shooter_pay}))
                 return events
 
         # Pong / kong / chow claims
@@ -417,6 +439,7 @@ class GameEngine:
         return events
 
     def _do_kong(self, claimer_seat: int, discarder_seat: int, tile: int) -> list[GameEvent]:
+        self.kong_declared = True
         claimer = self.players[claimer_seat]
         claimer.hand.concealed[tile] -= 3
         claimer.hand.melds.append(
@@ -435,11 +458,21 @@ class GameEngine:
             return events
 
         if shanten(claimer.hand.concealed, len(claimer.hand.melds)) == -1:
-            self._phase = "finished"
-            self.winner = claimer_seat
             drawn = next(e.tile for e in reversed(draw_events) if e.type == EventType.DRAW)
-            events.append(GameEvent(EventType.WIN_SELF_DRAW, seat=claimer_seat, tile=drawn))
-            return events
+            ctx = WinContext(winning_tile=drawn, is_self_draw=True, is_replacement=True,
+                             is_last_tile=self.wall_remaining <= 15)
+            tai_result = calculate_tai(claimer.hand, ctx)
+            if tai_result.is_valid_win():
+                _, zimo_pay = chip_payment(tai_result.total)
+                for other in _WIND_ORDER:
+                    if other != claimer_seat:
+                        self.chips[other] -= zimo_pay
+                        self.chips[claimer_seat] += zimo_pay
+                self._phase = "finished"
+                self.winner = claimer_seat
+                events.append(GameEvent(EventType.WIN_SELF_DRAW, seat=claimer_seat, tile=drawn,
+                                        detail={"tai": tai_result.total, "zimo_pay": zimo_pay}))
+                return events
 
         events.extend(self._execute_discard(claimer_seat))
         return events
