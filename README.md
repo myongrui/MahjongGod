@@ -172,14 +172,61 @@ python -m cracked.training.trainer \
 
 ```bash
 python -m cracked.training.self_play \
-    --episodes 5000 \
+    --episodes 20000 \
     --out models/policy.pt \
     --eval-every 500 \
     --eval-games 200 \
-    --resume   # continue from existing checkpoint
+    --resume        # continue from existing checkpoint
 ```
 
-The policy trains from all four seat positions (East/South/West/North) against three heuristic opponents that claim pongs during simulation. Wall stops at 15 tiles remaining, matching real game rules. Checkpoints are saved whenever evaluation improves.
+The policy trains from all four seat positions (East/South/West/North) against three heuristic opponents. Wall stops at 15 tiles remaining, matching real game rules. Checkpoints are saved whenever evaluation improves.
+
+**Reward tuning flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--gamma` | `1.0` | Discount factor for returns (`0.99` = standard discounting) |
+| `--shanten-reward` | `0.0` | Per-step reward for each shanten improvement |
+| `--tenpai-bonus` | `0.0` | One-time reward the first time the agent reaches tenpai in a game |
+| `--reward-scale` | `1.0` | Multiply all rewards by this factor (`0.0208` ≈ `1/48` normalises to `[-1, +1]`) |
+| `--ent-coef` | `0.01` | Entropy coefficient in the PPO loss |
+| `--shaping-scale` | `1.0` | PBRS potential-shaping weight |
+
+### Step 4 — Compare reward systems in parallel
+
+The experiment runner trains multiple reward variants simultaneously and prints a comparison table:
+
+```bash
+# List all built-in variants
+python -m cracked.training.experiment --list
+
+# Run all variants (one model file saved per variant under models/)
+python -m cracked.training.experiment --episodes 10000
+
+# Run specific variants
+python -m cracked.training.experiment tenpai normalized normed_tenpai --episodes 10000
+
+# Cap parallel workers (useful on machines with fewer cores)
+python -m cracked.training.experiment --episodes 10000 --workers 2
+
+# Resume all variants from their existing checkpoints
+python -m cracked.training.experiment --episodes 10000 --resume
+```
+
+Built-in variants:
+
+| Variant | What it tests |
+|---|---|
+| `baseline` | Original reward system |
+| `discount` | `gamma=0.99` discounting only |
+| `shanten_dense` | Per-step shanten-progress reward |
+| `strong_shaping` | Higher `shaping_scale` + lower `ent_coef` |
+| `full_fix` | Discount + shanten reward + strong shaping |
+| `tenpai` | One-time tenpai bonus (no normalisation) |
+| `normalized` | Reward normalisation to `[-1, +1]` only |
+| `normed_tenpai` | Normalised + tenpai bonus + `full_fix` params |
+
+Each variant saves its model to `models/{variant_name}.pt`. Add new variants by editing the `VARIANTS` dict at the top of `src/cracked/training/experiment.py`.
 
 ---
 
@@ -244,5 +291,6 @@ src/cracked/
     ├── model.py       # DangerNet (supervised residual MLP)
     ├── data.py        # JSONL log recording and loading
     ├── trainer.py     # DangerNet training loop
-    └── self_play.py   # ActorCritic, PPO, self-play training
+    ├── self_play.py   # ActorCritic, PPO, self-play training
+    └── experiment.py  # Parallel reward-variant experiment runner
 ```

@@ -193,8 +193,9 @@ class Step:
     action: int              # tile index discarded
     old_log_prob: float      # log prob under collection policy
     value_pred: float        # value estimate at this state
-    potential: float = 0.0   # state potential φ(s) for PBRS reward shaping
-    discard_reward: float = 0.0  # immediate defense penalty: −DEFENSE_WEIGHT × expected_cost
+    potential: float = 0.0          # state potential φ(s) for PBRS reward shaping
+    discard_reward: float = 0.0     # immediate defense penalty: −DEFENSE_WEIGHT × expected_cost
+    progress_reward: float = 0.0    # shanten-progress reward: +shanten_reward per shanten step gained
 
 
 @dataclass
@@ -267,6 +268,9 @@ def collect_episode(
     prevailing_wind: int = Wind.EAST,
     shaping_scale: float = SHAPING_SCALE,
     defense_weight: float = DEFENSE_WEIGHT,
+    shanten_reward: float = 0.0,
+    tenpai_bonus: float = 0.0,
+    reward_scale: float = 1.0,
 ) -> Episode:
     """
     Play one game: learning agent (actor_critic) vs three heuristic AI opponents.
@@ -294,6 +298,8 @@ def collect_episode(
     my_hand = my_concealed.copy()
     opp_discards: list[list[int]] = [[], [], []]
     opp_seat_to_idx = {seat: i for i, seat in enumerate(opp_seats)}
+    prev_shanten_val = shanten(my_hand, 0)  # tracks 13-tile shanten between agent turns
+    tenpai_reached = False  # fires tenpai_bonus only once per game
 
     episode = Episode()
     wall_idx = 0
@@ -316,9 +322,9 @@ def collect_episode(
                     continue
                 pay = _payment(tai)
                 if discarder == my_seat:
-                    episode.terminal_reward = -pay * 3.0
+                    episode.terminal_reward = -pay * 3.0 * reward_scale
                 elif claimer_seat == my_seat:
-                    episode.terminal_reward = pay * 3.0
+                    episode.terminal_reward = pay * 3.0 * reward_scale
                 return True
         return False
 
@@ -355,7 +361,7 @@ def collect_episode(
             tai = _estimate_tai(h.concealed, h.n_melds)
             if tai >= _MIN_TAI:
                 pay = _payment(tai)
-                episode.terminal_reward = pay * 3.0 if seat == my_seat else -pay
+                episode.terminal_reward = (pay * 3.0 if seat == my_seat else -pay) * reward_scale
                 return _finalize()
 
         # Discard: agent uses policy, AI uses heuristic
@@ -387,11 +393,19 @@ def collect_episode(
             my_hand[discard] -= 1
             h.concealed[discard] -= 1
 
+            s_after = shanten(my_hand, 0)
+            pr = shanten_reward * float(max(0, prev_shanten_val - s_after))
+            if not tenpai_reached and s_after == 0:
+                tenpai_reached = True
+                pr += tenpai_bonus
+            pr *= reward_scale
+            prev_shanten_val = s_after
+
             pot = _compute_potential(my_hand, 0, my_seat, prevailing_wind)
             opp_models = model_all_opponents(state_snap)
             cost = expected_shooting_cost(discard, state_snap, opp_models)
-            dr = -defense_weight * cost
-            episode.steps.append(Step(state_feat, action, old_log_prob, value, pot, dr))
+            dr = -defense_weight * cost * reward_scale
+            episode.steps.append(Step(state_feat, action, old_log_prob, value, pot, dr, pr))
         else:
             discard = _heuristic_discard(h)
             h.concealed[discard] -= 1
@@ -433,16 +447,20 @@ def ppo_update(
     ent_coef: float = ENT_COEF,
     ppo_epochs: int = 4,
     shaping_scale: float = SHAPING_SCALE,
+    gamma: float = 1.0,
 ) -> dict:
     """
     One PPO update pass over a batch of episodes.
 
-    Return for step t combines three signals:
-      1. Terminal reward: game outcome (win/shoot/draw).
-      2. PBRS: scale × (φ(s_T) − φ(s_t)) — rewards building toward tenpai
-         and high-value hands.
-      3. Cumulative future defense penalties: sum of discard_reward from step t
-         onward — penalizes dangerous discards by their expected shooting cost.
+    Computes discounted returns backwards from the terminal reward.  At each
+    step the shaped reward combines three signals:
+      1. discard_reward: immediate defense penalty.
+      2. progress_reward: per-step shanten-improvement bonus.
+      3. PBRS: γ·φ(s_{t+1}) − φ(s_t) — telescopes to the end-of-episode
+         potential gain, weighted by shaping_scale.
+
+    With gamma=1.0 and progress_reward=0 the result is identical to the
+    original formulation, so the default is fully backwards-compatible.
 
     Returns a dict with scalar loss metrics.
     """
@@ -453,21 +471,20 @@ def ppo_update(
     for ep in episodes:
         if not ep.steps:
             continue
-        G = ep.terminal_reward
-        # Cumulative future defense rewards: step i includes sum of
-        # discard_reward from i onward so earlier steps share later penalties.
         n = len(ep.steps)
-        cum_dr = [0.0] * n
-        acc = 0.0
+        returns = [0.0] * n
+        G = ep.terminal_reward
         for i in range(n - 1, -1, -1):
-            acc += ep.steps[i].discard_reward
-            cum_dr[i] = acc
+            step = ep.steps[i]
+            next_pot = ep.final_potential if i == n - 1 else ep.steps[i + 1].potential
+            pbrs = shaping_scale * (gamma * next_pot - step.potential)
+            G = step.discard_reward + step.progress_reward + pbrs + gamma * G
+            returns[i] = G
         for i, step in enumerate(ep.steps):
-            shaped = G + cum_dr[i] + shaping_scale * (ep.final_potential - step.potential)
             all_states.append(step.state_feat)
             all_actions.append(step.action)
             all_old_lp.append(step.old_log_prob)
-            all_returns.append(shaped)
+            all_returns.append(returns[i])
 
     if not all_states:
         return {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
@@ -570,7 +587,12 @@ def train_self_play(
     shaping_scale: float = SHAPING_SCALE,
     defense_weight: float = DEFENSE_WEIGHT,
     resume: bool = False,
-) -> None:
+    gamma: float = 1.0,
+    shanten_reward: float = 0.0,
+    tenpai_bonus: float = 0.0,
+    reward_scale: float = 1.0,
+    ent_coef: float = ENT_COEF,
+) -> dict:
     """
     Train ActorCritic via self-play against heuristic opponents.
 
@@ -598,13 +620,16 @@ def train_self_play(
             print(f"Resumed from {model_path}")
 
     best_mean_net = float("-inf")
+    last_stats: dict = {}
     episode_buffer: list[Episode] = []
 
     if verbose:
         print(
             f"Training for {n_episodes} episodes, "
             f"batch={episodes_per_update}, shaping={shaping_scale}, "
-            f"defense={defense_weight}"
+            f"defense={defense_weight}, gamma={gamma}, "
+            f"shanten_reward={shanten_reward}, tenpai_bonus={tenpai_bonus}, "
+            f"reward_scale={reward_scale}, ent_coef={ent_coef}"
         )
 
     _WINDS = [int(Wind.EAST), int(Wind.SOUTH), int(Wind.WEST), int(Wind.NORTH)]
@@ -613,12 +638,14 @@ def train_self_play(
         ep_seat = rng.choice(_WINDS)  # train from all seats equally
         episode_buffer.append(
             collect_episode(model, rng, my_seat=ep_seat, shaping_scale=shaping_scale,
-                            defense_weight=defense_weight)
+                            defense_weight=defense_weight, shanten_reward=shanten_reward,
+                            tenpai_bonus=tenpai_bonus, reward_scale=reward_scale)
         )
 
         if len(episode_buffer) >= episodes_per_update:
             metrics = ppo_update(
-                model, optimizer, episode_buffer, shaping_scale=shaping_scale
+                model, optimizer, episode_buffer, shaping_scale=shaping_scale,
+                gamma=gamma, ent_coef=ent_coef,
             )
             episode_buffer.clear()
 
@@ -634,6 +661,7 @@ def train_self_play(
             model.eval()
             stats = evaluate_vs_heuristic(model, n_games=eval_games, seed=ep_num)
             model.train()
+            last_stats = stats
             if verbose:
                 print(
                     f"  eval @ {ep_num:5d}: "
@@ -645,10 +673,16 @@ def train_self_play(
                 best_mean_net = stats["mean_net"]
                 save_policy(model, model_path, optimizer)
                 if verbose:
-                    print(f"  → new best ({best_mean_net:+.3f}), saved to {model_path}")
+                    print(f"  -> new best ({best_mean_net:+.3f}), saved to {model_path}")
 
     if verbose:
         print(f"Done. Best mean_net: {best_mean_net:+.3f}")
+    return {
+        "best_mean_net": best_mean_net,
+        "final_win_rate": last_stats.get("win_rate", 0.0),
+        "final_shoot_rate": last_stats.get("shoot_rate", 0.0),
+        "final_draw_rate": last_stats.get("draw_rate", 0.0),
+    }
 
 
 def _cli():
@@ -665,6 +699,16 @@ def _cli():
                         help="PBRS reward shaping weight (0 = off)")
     parser.add_argument("--defense-weight", type=float, default=DEFENSE_WEIGHT,
                         help="Defense penalty weight per step (0 = off)")
+    parser.add_argument("--gamma", type=float, default=1.0,
+                        help="Discount factor for returns (1.0 = no discounting)")
+    parser.add_argument("--shanten-reward", type=float, default=0.0,
+                        help="Per-step reward for each shanten improvement")
+    parser.add_argument("--tenpai-bonus", type=float, default=0.0,
+                        help="One-time reward the first time the agent reaches tenpai in a game")
+    parser.add_argument("--reward-scale", type=float, default=1.0,
+                        help="Scale all rewards by this factor (e.g. 1/48 normalises to [-1,+1])")
+    parser.add_argument("--ent-coef", type=float, default=ENT_COEF,
+                        help="Entropy coefficient in PPO loss")
     parser.add_argument("--resume", action="store_true",
                         help="Continue training from existing checkpoint at --out path")
     args = parser.parse_args()
@@ -678,6 +722,11 @@ def _cli():
         eval_games=args.eval_games,
         shaping_scale=args.shaping_scale,
         defense_weight=args.defense_weight,
+        gamma=args.gamma,
+        shanten_reward=args.shanten_reward,
+        tenpai_bonus=args.tenpai_bonus,
+        reward_scale=args.reward_scale,
+        ent_coef=args.ent_coef,
         resume=args.resume,
     )
 
