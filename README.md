@@ -179,7 +179,7 @@ python -m cracked.training.self_play \
     --resume        # continue from existing checkpoint
 ```
 
-The policy trains from all four seat positions (East/South/West/North) against three heuristic opponents. Wall stops at 15 tiles remaining, matching real game rules. Checkpoints are saved whenever evaluation improves.
+The policy trains from all four seat positions (East/South/West/North) against three heuristic opponents. The agent auto-claims pongs, kongs, and chows using the same heuristics as its opponents (equal footing), then runs the RL policy to decide what to discard after each claim. Wall stops at 15 tiles remaining, matching real game rules. Checkpoints are saved whenever evaluation improves.
 
 **Reward tuning flags:**
 
@@ -190,7 +190,8 @@ The policy trains from all four seat positions (East/South/West/North) against t
 | `--tenpai-bonus` | `0.0` | One-time reward the first time the agent reaches tenpai in a game |
 | `--reward-scale` | `1.0` | Multiply all rewards by this factor (`0.0208` ≈ `1/48` normalises to `[-1, +1]`) |
 | `--ent-coef` | `0.01` | Entropy coefficient in the PPO loss |
-| `--shaping-scale` | `1.0` | PBRS potential-shaping weight |
+| `--shaping-scale` | `1.0` | PBRS potential-shaping weight (uses shanten + tai potential + acceptance count) |
+| `--defense-weight` | `0.02` | Per-step penalty scaled by expected shooting cost |
 
 ### Step 4 — Compare reward systems in parallel
 
@@ -225,6 +226,10 @@ Built-in variants:
 | `tenpai` | One-time tenpai bonus (no normalisation) |
 | `normalized` | Reward normalisation to `[-1, +1]` only |
 | `normed_tenpai` | Normalised + tenpai bonus + `full_fix` params |
+| `recommended` | Scaled PBRS + acceptance potential + strong defense (the recommended starting point) |
+| `ablation_scale_only` | Just the PBRS scale fix, no other changes |
+| `ablation_no_shaping` | Pure terminal reward + defense, PBRS disabled |
+| `ablation_unscaled` | `recommended` params but without reward normalisation |
 
 Each variant saves its model to `models/{variant_name}.pt`. Add new variants by editing the `VARIANTS` dict at the top of `src/cracked/training/experiment.py`.
 

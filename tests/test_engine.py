@@ -23,8 +23,9 @@ def test_deal_tile_counts():
 def test_deal_wall_remaining():
     engine = GameEngine(seed=42)
     engine.deal()
-    # 136 total - 52 dealt = 84
-    assert engine.wall_remaining == 84
+    # 148 total (136 standard + 12 bonus) - 52 standard dealt - bonus consumed during deal
+    # Bonus tiles consumed during dealing shrink the wall, so remainder is in [84, 96]
+    assert 84 <= engine.wall_remaining <= 96
 
 def test_deal_no_tile_overflow():
     """No tile type should appear more than 4 times across all hands."""
@@ -40,7 +41,7 @@ def test_deal_resets_state():
     engine.step()
     engine.deal()
     assert engine.turn_number == 0
-    assert engine.wall_remaining == 84
+    assert 84 <= engine.wall_remaining <= 96
     assert not engine.is_finished
 
 
@@ -165,7 +166,7 @@ def test_player_view_wall_remaining():
     engine = GameEngine(seed=42)
     engine.deal()
     view = engine.player_view_for(EAST)
-    assert view.wall_tiles_remaining == 84
+    assert 84 <= view.wall_tiles_remaining <= 96
 
 
 # ---------------------------------------------------------------------------

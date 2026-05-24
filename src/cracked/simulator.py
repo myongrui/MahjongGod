@@ -4,9 +4,9 @@ Monte Carlo game simulator for Singapore Mahjong.
 Simulates complete games forward from the current state to estimate
 win and shoot probabilities for each candidate discard.
 
-V1 simplifications (to be refined in later phases):
-  - No meld claiming during simulation (pong/chow from discards not modelled)
-  - Simplified tai estimation for payment calculation
+Remaining simplifications vs the full engine:
+  - Tai is estimated (suit/dragon heuristic) rather than using the full scoring engine
+  - Agent never claims pong/kong/chow on opponent discards (only chooses what to discard)
   - All players use the same pure-shanten discard heuristic
 """
 
@@ -21,6 +21,7 @@ import numpy as np
 from cracked.tiles import NTILES, is_suited, is_honor, suit_of, DRAGON_START, DRAGON_END
 from cracked.game_state import GameState
 from cracked.shanten import shanten
+from cracked.scoring import chip_payment
 
 _MIN_TAI = 1  # minimum tai required to declare a win
 
@@ -144,6 +145,77 @@ def _payment(tai: int) -> float:
     return pow(2.0, tai - 1.0)
 
 
+def _wants_pong_sim(hand: SimHand, tile: int) -> bool:
+    """True if ponging maintains or improves best post-pong shanten."""
+    if hand.concealed[tile] < 2:
+        return False
+    current_s = shanten(hand.concealed, hand.n_melds)
+    if current_s == -1:
+        return False
+    hand.concealed[tile] -= 2
+    hand.n_melds += 1
+    eye = np.eye(NTILES, dtype=np.int8)
+    best_s = min(
+        (shanten(hand.concealed - eye[t], hand.n_melds)
+         for t in range(NTILES) if hand.concealed[t] > 0),
+        default=current_s,
+    )
+    hand.concealed[tile] += 2
+    hand.n_melds -= 1
+    return best_s <= current_s
+
+
+def _wants_kong_sim(hand: SimHand, tile: int) -> bool:
+    """True if konging doesn't significantly worsen shanten (+1 allowed; replacement compensates)."""
+    if hand.concealed[tile] < 3:
+        return False
+    current_s = shanten(hand.concealed, hand.n_melds)
+    if current_s == -1:
+        return False
+    hand.concealed[tile] -= 3
+    hand.n_melds += 1
+    eye = np.eye(NTILES, dtype=np.int8)
+    best_s = min(
+        (shanten(hand.concealed - eye[t], hand.n_melds)
+         for t in range(NTILES) if hand.concealed[t] > 0),
+        default=current_s,
+    )
+    hand.concealed[tile] += 3
+    hand.n_melds -= 1
+    return best_s <= current_s + 1
+
+
+def _pick_best_chow_sim(hand: SimHand, tile: int) -> Optional[tuple[int, int, int]]:
+    """Best chow option that strictly improves shanten, or None."""
+    if tile >= 27:
+        return None
+    suit_start = (tile // 9) * 9
+    rank = tile % 9
+    current_s = shanten(hand.concealed, hand.n_melds)
+    best_option: Optional[tuple[int, int, int]] = None
+    best_s = current_s  # chow requires strict improvement
+    eye = np.eye(NTILES, dtype=np.int8)
+    for low in (rank - 2, rank - 1, rank):
+        if low < 0 or low + 2 > 8:
+            continue
+        t1, t2, t3 = suit_start + low, suit_start + low + 1, suit_start + low + 2
+        if not all(hand.concealed[t] > 0 for t in (t1, t2, t3) if t != tile):
+            continue
+        test = hand.concealed.copy()
+        for t in (t1, t2, t3):
+            if t != tile:
+                test[t] -= 1
+        test_melds = hand.n_melds + 1
+        min_s = min(
+            (shanten(test - eye[t], test_melds) for t in range(NTILES) if test[t] > 0),
+            default=current_s,
+        )
+        if min_s < best_s:
+            best_s = min_s
+            best_option = (t1, t2, t3)
+    return best_option
+
+
 # ---------------------------------------------------------------------------
 # Hand dealing
 # ---------------------------------------------------------------------------
@@ -192,59 +264,129 @@ def _play_one_game(
     Simulate one complete game turn-by-turn until someone wins or wall empties.
 
     Players are ordered by seat wind (East first).
-    Pong/chow claiming is not modelled in V1 — players only win by self-draw
-    or from another player's discard.
+    Claims: pong/kong (clockwise priority) and chow (left player only).
+    Dead wall: stops at 15 tiles remaining, matching Singapore rules.
     """
     all_seats = sorted([my_seat] + [h.seat for h in opp_hands])
     hands: dict[int, SimHand] = {my_seat: my_hand}
     for h in opp_hands:
         hands[h.seat] = h
 
+    n = len(all_seats)
     wall_idx = 0
-    max_rounds = 40  # Singapore games rarely exceed 30 rounds
+    wall_remaining = len(wall)
+    seat_idx = 0
+    max_turns = 40 * n * 2
 
-    for _ in range(max_rounds):
-        for seat in all_seats:
-            if wall_idx >= len(wall):
-                return GameResult(None, False, None, 0, 0.0)
-
-            h = hands[seat]
-            drawn = wall[wall_idx]
-            wall_idx += 1
-            h.concealed[drawn] += 1
-
-            # Self-draw win check
-            if h.is_winner():
-                tai = _estimate_tai(h.concealed, h.n_melds)
-                if tai >= _MIN_TAI:
-                    pay = _payment(tai)
-                    if seat == my_seat:
-                        return GameResult(seat, True, None, tai, pay * 3.0)
-                    else:
-                        return GameResult(seat, True, None, tai, -pay)
-
-            # Discard
-            discard = _heuristic_discard(h)
-            h.concealed[discard] -= 1
-
-            # Ron (discard) win check — all other players
-            for claimer_seat in all_seats:
-                if claimer_seat == seat:
+    def _ron_result(shooter: int, tile: int) -> Optional[GameResult]:
+        for cs in all_seats:
+            if cs == shooter:
+                continue
+            if hands[cs].can_win_from(tile):
+                tai = _estimate_tai(hands[cs].concealed, hands[cs].n_melds)
+                if tai < _MIN_TAI:
                     continue
-                claimer = hands[claimer_seat]
-                if claimer.can_win_from(discard):
-                    tai = _estimate_tai(claimer.concealed, claimer.n_melds)
-                    if tai < _MIN_TAI:
-                        continue
-                    pay = _payment(tai)
-                    if seat == my_seat:
-                        # We shot: shooter pays all (3 losers)
-                        return GameResult(claimer_seat, False, seat, tai, -pay * 3.0)
-                    elif claimer_seat == my_seat:
-                        # We won: shooter pays us
-                        return GameResult(my_seat, False, seat, tai, pay * 3.0)
-                    else:
-                        return GameResult(claimer_seat, False, seat, tai, 0.0)
+                shooter_pay, _ = chip_payment(tai)
+                if shooter == my_seat:
+                    return GameResult(cs, False, shooter, tai, -shooter_pay)
+                elif cs == my_seat:
+                    return GameResult(my_seat, False, shooter, tai, shooter_pay)
+                else:
+                    return GameResult(cs, False, shooter, tai, 0.0)
+        return None
+
+    for _ in range(max_turns):
+        if wall_remaining <= 15 or wall_idx >= len(wall):
+            return GameResult(None, False, None, 0, 0.0)
+
+        seat = all_seats[seat_idx]
+        drawn = wall[wall_idx]
+        wall_idx += 1
+        wall_remaining -= 1
+        h = hands[seat]
+        h.concealed[drawn] += 1
+
+        # Self-draw win check
+        if h.is_winner():
+            tai = _estimate_tai(h.concealed, h.n_melds)
+            if tai >= _MIN_TAI:
+                _, zimo_pay = chip_payment(tai)
+                net = zimo_pay * 3.0 if seat == my_seat else -zimo_pay
+                return GameResult(seat, True, None, tai, net)
+
+        # Discard
+        discard = _heuristic_discard(h)
+        h.concealed[discard] -= 1
+
+        # Ron check
+        ron = _ron_result(seat, discard)
+        if ron is not None:
+            return ron
+
+        # Claims: kong/pong (clockwise priority) then chow (left player only)
+        claimed = False
+        for offset in range(1, n):
+            cs = all_seats[(seat_idx + offset) % n]
+            ch = hands[cs]
+            if ch.concealed[discard] >= 3 and _wants_kong_sim(ch, discard):
+                ch.concealed[discard] -= 3
+                ch.n_melds += 1
+                rep = None
+                while wall_idx < len(wall) and wall_remaining > 15:
+                    rtid = wall[wall_idx]
+                    wall_idx += 1
+                    wall_remaining -= 1
+                    if rtid < 34:
+                        rep = rtid
+                        break
+                if rep is None:
+                    return GameResult(None, False, None, 0, 0.0)
+                ch.concealed[rep] += 1
+                if ch.is_winner():
+                    tai = _estimate_tai(ch.concealed, ch.n_melds)
+                    if tai >= _MIN_TAI:
+                        _, zimo_pay = chip_payment(tai)
+                        net = zimo_pay * 3.0 if cs == my_seat else -zimo_pay
+                        return GameResult(cs, True, None, tai, net)
+                kong_disc = _heuristic_discard(ch)
+                ch.concealed[kong_disc] -= 1
+                ron = _ron_result(cs, kong_disc)
+                if ron is not None:
+                    return ron
+                seat_idx = (seat_idx + offset + 1) % n
+                claimed = True
+                break
+            elif ch.concealed[discard] >= 2 and _wants_pong_sim(ch, discard):
+                ch.concealed[discard] -= 2
+                ch.n_melds += 1
+                pong_disc = _heuristic_discard(ch)
+                ch.concealed[pong_disc] -= 1
+                ron = _ron_result(cs, pong_disc)
+                if ron is not None:
+                    return ron
+                seat_idx = (seat_idx + offset + 1) % n
+                claimed = True
+                break
+
+        if not claimed:
+            left_cs = all_seats[(seat_idx + 1) % n]
+            chow = _pick_best_chow_sim(hands[left_cs], discard)
+            if chow is not None:
+                ch = hands[left_cs]
+                for t in chow:
+                    if t != discard:
+                        ch.concealed[t] -= 1
+                ch.n_melds += 1
+                chow_disc = _heuristic_discard(ch)
+                ch.concealed[chow_disc] -= 1
+                ron = _ron_result(left_cs, chow_disc)
+                if ron is not None:
+                    return ron
+                seat_idx = (seat_idx + 2) % n
+                claimed = True
+
+        if not claimed:
+            seat_idx = (seat_idx + 1) % n
 
     return GameResult(None, False, None, 0, 0.0)
 

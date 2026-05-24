@@ -84,8 +84,13 @@ def test_deal_fresh_game_tile_count():
     from cracked.training.self_play import _deal_fresh_game
     rng = random.Random(0)
     my_c, opp_cs, wall = _deal_fresh_game(rng)
-    total = my_c.sum() + sum(a.sum() for a in opp_cs) + len(wall)
-    assert total == 136
+    # Each player receives exactly 13 standard tiles; bonus tiles (IDs 34+) may appear in wall
+    assert my_c.sum() == 13
+    for arr in opp_cs:
+        assert arr.sum() == 13
+    # All 136 standard tiles are accounted for across hands and wall
+    standard_in_wall = sum(1 for t in wall if t < 34)
+    assert my_c.sum() + sum(a.sum() for a in opp_cs) + standard_in_wall == 136
 
 
 def test_deal_fresh_game_no_tile_exceeds_four():

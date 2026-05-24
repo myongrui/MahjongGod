@@ -119,6 +119,47 @@ VARIANTS: dict[str, dict] = {
         "defense_weight": DEFENSE_WEIGHT,
         "ent_coef": 0.001,
     },
+    # --- recommended reward system + ablation variants ---
+    "recommended": {
+        "description": "Scaled PBRS + acceptance potential + strong defense",
+        "gamma": 0.99,
+        "shanten_reward": 0.0,
+        "tenpai_bonus": 0.0,
+        "reward_scale": 1 / 48,
+        "shaping_scale": 6.0,
+        "defense_weight": 0.5,
+        "ent_coef": 0.005,
+    },
+    "ablation_scale_only": {
+        "description": "Just fix the PBRS scale, no other changes",
+        "gamma": 1.0,
+        "shanten_reward": 0.0,
+        "tenpai_bonus": 0.0,
+        "reward_scale": 1 / 48,
+        "shaping_scale": 6.0,
+        "defense_weight": 0.02,
+        "ent_coef": 0.01,
+    },
+    "ablation_no_shaping": {
+        "description": "Pure terminal + defense, no PBRS",
+        "gamma": 0.99,
+        "shanten_reward": 0.0,
+        "tenpai_bonus": 0.0,
+        "reward_scale": 1 / 48,
+        "shaping_scale": 0.0,
+        "defense_weight": 0.5,
+        "ent_coef": 0.01,
+    },
+    "ablation_unscaled": {
+        "description": "Recommended params but reward_scale=1.0",
+        "gamma": 0.99,
+        "shanten_reward": 0.0,
+        "tenpai_bonus": 0.0,
+        "reward_scale": 1.0,
+        "shaping_scale": 3.0,
+        "defense_weight": 0.5,
+        "ent_coef": 0.005,
+    },
 }
 
 
