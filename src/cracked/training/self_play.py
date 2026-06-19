@@ -30,7 +30,7 @@ from cracked.simulator import (
 )
 from cracked.scoring import chip_payment
 from cracked.optimizer import hand_tai_potential
-from cracked.tiles_away import tiles_away
+from cracked.tiles_away import tiles_away, acceptance_count
 from cracked.danger import expected_shooting_cost
 from cracked.opponent_model import model_all_opponents
 from cracked.training.features import N_STATE_FEATURES, extract_state_features
@@ -57,14 +57,20 @@ def _compute_potential(
     """
     State potential for PBRS (potential-based reward shaping).
 
-    Combines tiles_away proximity and tai ceiling so the agent receives a
-    dense learning signal at every step rather than only at game end.
+    Combines tiles_away proximity, tai ceiling, and tile acceptance count
+    so the agent receives a dense learning signal at every step.
     """
     s = tiles_away(concealed, n_melds)
     tiles_away_val = (7 - s) / 8.0
     tai_pot = hand_tai_potential(concealed, [], seat_wind, prevailing_wind)
     tai_val = min(tai_pot / 6.0, 1.0)
-    return 1.5 * tiles_away_val + 1.0 * tai_val
+
+    acc_val = 0.0
+    if unknown_tiles is not None and s >= 0:
+        acc = acceptance_count(concealed, unknown_tiles, n_melds)
+        acc_val = min(sum(acc.values()) / 30.0, 1.0)
+
+    return 1.2 * tiles_away_val + 0.8 * tai_val + 0.5 * acc_val
 
 
 def oracle_threat(opp_sims: list) -> float:
@@ -85,27 +91,6 @@ def oracle_threat(opp_sims: list) -> float:
     if best >= 99:
         return 0.0
     return 1.0 / (1.0 + max(best, 0))
-
-
-def _wants_pong(hand: SimHand, tile: int) -> bool:
-    """True if claiming a pong of tile maintains or improves best post-pong tiles_away."""
-    if hand.concealed[tile] < 2:
-        return False
-    s_before = tiles_away(hand.concealed, hand.n_melds)
-    hand.concealed[tile] -= 2
-    hand.n_melds += 1
-    best_s = 99
-    for t in range(NTILES):
-        if hand.concealed[t] == 0:
-            continue
-        hand.concealed[t] -= 1
-        s = tiles_away(hand.concealed, hand.n_melds)
-        hand.concealed[t] += 1
-        if s < best_s:
-            best_s = s
-    hand.concealed[tile] += 2
-    hand.n_melds -= 1
-    return best_s <= s_before
 
 
 def _require_torch():
@@ -308,8 +293,9 @@ def collect_episode(
     """
     Play one game: learning agent (actor_critic) vs three heuristic AI opponents.
 
-    AI opponents will claim pongs when it maintains or improves their tiles_away.
-    The agent does not auto-pong — it only decides what to discard on its draw.
+    Claims (pong/kong/chow) are decided by the same heuristics as AI opponents
+    so the agent competes on equal footing.  After each claim the agent runs its
+    RL policy to choose what to discard — giving more gradient signal per game.
     Wall stops at 15 tiles remaining, matching the real game dead-wall rule.
     """
     torch = _require_torch()
@@ -331,8 +317,8 @@ def collect_episode(
     my_hand = my_concealed.copy()
     opp_discards: list[list[int]] = [[], [], []]
     opp_seat_to_idx = {seat: i for i, seat in enumerate(opp_seats)}
-    prev_tiles_away_val = tiles_away(my_hand, 0)  # tracks 13-tile tiles_away between agent turns
-    waiting_reached = False  # fires waiting_bonus only once per game
+    prev_tiles_away_val = tiles_away(my_hand, 0)
+    waiting_reached = False
 
     episode = Episode()
     wall_idx = 0
@@ -349,8 +335,7 @@ def collect_episode(
         ) * reward_scale
         return episode
 
-    def _check_ron(discarder: int, discard: int) -> bool:
-        """Discard-win check after a discard. Sets terminal_reward and returns True if game over."""
+    def _check_ron(discarder: int, tile: int) -> bool:
         for claimer_seat in all_seats:
             if claimer_seat == discarder:
                 continue
@@ -368,7 +353,7 @@ def collect_episode(
 
     def _run_agent_discard() -> int:
         """Run RL policy to pick a discard. Mutates my_hand, my_sim, episode. Returns tile id."""
-        nonlocal prev_shanten_val, tenpai_reached
+        nonlocal prev_tiles_away_val, waiting_reached
 
         state_snap = _build_game_state(
             my_hand, my_seat, prevailing_wind, wall_remaining, turn, opp_discards, opp_seats,
@@ -396,29 +381,76 @@ def collect_episode(
         my_hand[discard_tile] -= 1
         my_sim.concealed[discard_tile] -= 1
 
-            s_after = tiles_away(my_hand, 0)
-            pr = tiles_away_reward * float(max(0, prev_tiles_away_val - s_after))
-            if not waiting_reached and s_after == 0:
-                waiting_reached = True
-                pr += waiting_bonus
-            pr *= reward_scale
-            prev_tiles_away_val = s_after
+        s_after = tiles_away(my_hand, my_sim.n_melds)
+        pr = tiles_away_reward * float(max(0, prev_tiles_away_val - s_after))
+        if not waiting_reached and s_after == 0:
+            waiting_reached = True
+            pr += waiting_bonus
+        pr *= reward_scale
+        prev_tiles_away_val = s_after
 
-            pot = _compute_potential(my_hand, 0, my_seat, prevailing_wind)
-            opp_models = model_all_opponents(state_snap)
-            cost = expected_shooting_cost(discard, state_snap, opp_models)
-            dr = -defense_weight * cost * reward_scale
-            # Oracle guiding: privileged perfect-information caution signal,
-            # annealed to zero over training by the caller (oracle_coef → 0).
-            if oracle_coef > 0.0:
-                dr += -oracle_coef * oracle_threat(opp_sims) * reward_scale
-            episode.steps.append(Step(state_feat, action, old_log_prob, value, pot, dr, pr))
+        pot = _compute_potential(
+            my_hand, my_sim.n_melds, my_seat, prevailing_wind, state_snap.unknown_tiles(),
+        ) * reward_scale
+        opp_models = model_all_opponents(state_snap)
+        cost = expected_shooting_cost(discard_tile, state_snap, opp_models)
+        dr = -defense_weight * cost * reward_scale
+        # Oracle guiding: privileged perfect-information caution signal,
+        # annealed to zero over training by the caller (oracle_coef → 0).
+        if oracle_coef > 0.0:
+            dr += -oracle_coef * oracle_threat(opp_sims) * reward_scale
+        episode.steps.append(Step(state_feat, action, old_log_prob, value, pot, dr, pr))
+
+        return discard_tile
+
+    # East always draws first; all_seats is sorted so index 0 = East
+    seat_cursor = 0
+
+    for _ in range(MAX_ROUNDS * n * 2):  # generous upper cap
+        if wall_remaining <= 15:
+            return _finalize()
+
+        seat = all_seats[seat_cursor % n]
+
+        # Draw a non-bonus tile; bonus tiles (IDs 34-45) are set aside with auto-replacement
+        drawn = None
+        while wall_idx < len(wall):
+            if wall_remaining <= 15:
+                return _finalize()
+            tid = wall[wall_idx]
+            wall_idx += 1
+            wall_remaining -= 1
+            if tid < 34:
+                drawn = tid
+                break
+        if drawn is None:
+            return _finalize()
+
+        turn += 1
+        sim_by_seat[seat].concealed[drawn] += 1
+        if seat == my_seat:
+            my_hand[drawn] += 1
+
+        h = sim_by_seat[seat]
+
+        # Self-draw win check
+        if h.is_winner():
+            tai = _estimate_tai(h.concealed, h.n_melds)
+            if tai >= _MIN_TAI:
+                _, zimo_pay = chip_payment(tai)
+                net = zimo_pay * 3.0 if seat == my_seat else -zimo_pay
+                episode.terminal_reward = net * reward_scale
+                return _finalize()
+
+        # Discard: agent uses RL policy, AI uses heuristic
+        if seat == my_seat:
+            discard = _run_agent_discard()
         else:
             discard = _heuristic_discard(h)
             h.concealed[discard] -= 1
             opp_discards[opp_seat_to_idx[seat]].append(discard)
 
-        # Discard-win check
+        # Ron check (priority over all claims)
         if _check_ron(seat, discard):
             return _finalize()
 
@@ -679,10 +711,6 @@ def train_self_play(
 
     Uses potential-based reward shaping (PBRS) derived from tiles_away
     proximity and tai-potential to give the agent dense learning signal.
-
-    oracle_coef > 0 enables Suphx-style oracle guiding: a privileged
-    perfect-information caution signal that is linearly annealed from oracle_coef
-    to 0 across training, so the final policy depends only on observable state.
 
     Saves the best checkpoint (by mean_net in evaluation) to model_path.
     Pass resume=True to continue from an existing checkpoint at model_path.
