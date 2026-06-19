@@ -25,8 +25,10 @@ from cracked.tiles import NTILES, Wind
 from cracked.hand import HandState
 from cracked.game_state import GameState, PlayerView
 from cracked.simulator import (
-    SimHand, _heuristic_discard, _estimate_tai, _payment, _MIN_TAI,
+    SimHand, _heuristic_discard, _estimate_tai, _MIN_TAI,
+    _wants_pong_sim, _wants_kong_sim, _pick_best_chow_sim,
 )
+from cracked.scoring import chip_payment
 from cracked.optimizer import hand_tai_potential
 from cracked.tiles_away import tiles_away
 from cracked.danger import expected_shooting_cost
@@ -50,6 +52,7 @@ def _compute_potential(
     n_melds: int,
     seat_wind: int,
     prevailing_wind: int,
+    unknown_tiles: np.ndarray | None = None,
 ) -> float:
     """
     State potential for PBRS (potential-based reward shaping).
@@ -232,22 +235,31 @@ class Episode:
 
 def _deal_fresh_game(rng: random.Random):
     """
-    Deal a complete 4-player starting position.
+    Deal a complete 4-player starting position with all 148 tiles (136 standard + 12 bonus).
 
     Returns (my_concealed, opp_concealeds, wall) where:
-      my_concealed   — int8 array (34,) for the learning agent (East)
+      my_concealed   — int8 array (34,) for the learning agent
       opp_concealeds — list of 3 int8 arrays, one per opponent
-      wall           — list of tile IDs (84 tiles, drawn in order)
+      wall           — remaining tiles (including bonus tiles IDs 34-45)
+    Bonus tiles encountered during dealing are set aside without replacement,
+    mirroring the engine behaviour. Bonus tiles in the wall are handled during play.
     """
-    pool = [tid for tid in range(NTILES) for _ in range(4)]
+    pool = [tid for tid in range(NTILES) for _ in range(4)] + list(range(34, 46))
     rng.shuffle(pool)
     hands = []
-    for i in range(4):
+    idx = 0
+    for _ in range(4):
         arr = np.zeros(NTILES, dtype=np.int8)
-        for t in pool[i * 13: (i + 1) * 13]:
-            arr[t] += 1
+        dealt = 0
+        while dealt < 13 and idx < len(pool):
+            tid = pool[idx]
+            idx += 1
+            if tid >= 34:  # bonus tile during deal — set aside, continue dealing
+                continue
+            arr[tid] += 1
+            dealt += 1
         hands.append(arr)
-    return hands[0], hands[1:], pool[52:]
+    return hands[0], hands[1:], pool[idx:]
 
 
 def _build_game_state(
@@ -329,7 +341,12 @@ def collect_episode(
     n = len(all_seats)
 
     def _finalize() -> Episode:
-        episode.final_potential = _compute_potential(my_hand, 0, my_seat, prevailing_wind)
+        state_snap = _build_game_state(
+            my_hand, my_seat, prevailing_wind, wall_remaining, turn, opp_discards, opp_seats,
+        )
+        episode.final_potential = _compute_potential(
+            my_hand, my_sim.n_melds, my_seat, prevailing_wind, state_snap.unknown_tiles(),
+        ) * reward_scale
         return episode
 
     def _check_ron(discarder: int, discard: int) -> bool:
@@ -337,82 +354,47 @@ def collect_episode(
         for claimer_seat in all_seats:
             if claimer_seat == discarder:
                 continue
-            if sim_by_seat[claimer_seat].can_win_from(discard):
+            if sim_by_seat[claimer_seat].can_win_from(tile):
                 tai = _estimate_tai(sim_by_seat[claimer_seat].concealed, sim_by_seat[claimer_seat].n_melds)
                 if tai < _MIN_TAI:
                     continue
-                pay = _payment(tai)
+                shooter_pay, _ = chip_payment(tai)
                 if discarder == my_seat:
-                    episode.terminal_reward = -pay * 3.0 * reward_scale
+                    episode.terminal_reward = -shooter_pay * reward_scale
                 elif claimer_seat == my_seat:
-                    episode.terminal_reward = pay * 3.0 * reward_scale
+                    episode.terminal_reward = shooter_pay * reward_scale
                 return True
         return False
 
-    def _find_pong_claimer(discarder: int, discard: int) -> Optional[int]:
-        """First AI seat (in order) willing to pong the discard. Agent never auto-pongs."""
-        for cs in all_seats:
-            if cs == discarder or cs == my_seat:
-                continue
-            if _wants_pong(sim_by_seat[cs], discard):
-                return cs
-        return None
+    def _run_agent_discard() -> int:
+        """Run RL policy to pick a discard. Mutates my_hand, my_sim, episode. Returns tile id."""
+        nonlocal prev_shanten_val, tenpai_reached
 
-    # East always draws first; all_seats is sorted so index 0 = East
-    seat_cursor = 0
+        state_snap = _build_game_state(
+            my_hand, my_seat, prevailing_wind, wall_remaining, turn, opp_discards, opp_seats,
+        )
+        state_feat = extract_state_features(state_snap)
+        feat_t = torch.tensor(state_feat, dtype=torch.float32).unsqueeze(0)
 
-    for _ in range(MAX_ROUNDS * n * 2):  # generous upper cap
-        # Dead-wall check: stop drawing when 15 tiles remain
-        if wall_remaining <= 15:
-            return _finalize()
+        with torch.no_grad():
+            logits, value_t = actor_critic(feat_t)
+        logits = logits.squeeze(0)
+        value = value_t.squeeze(0).item()
 
-        seat = all_seats[seat_cursor % n]
-        drawn = wall[wall_idx]
-        wall_idx += 1
-        wall_remaining -= 1
-        turn += 1
-        sim_by_seat[seat].concealed[drawn] += 1
-        if seat == my_seat:
-            my_hand[drawn] += 1
+        valid = torch.zeros(NTILES, dtype=torch.bool)
+        for t in range(NTILES):
+            if my_hand[t] > 0:
+                valid[t] = True
+        logits[~valid] = -1e9
 
-        h = sim_by_seat[seat]
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs = log_probs.exp()
+        action = torch.multinomial(probs, 1).item()
+        old_log_prob = log_probs[action].item()
 
-        # Self-draw win check
-        if h.is_winner():
-            tai = _estimate_tai(h.concealed, h.n_melds)
-            if tai >= _MIN_TAI:
-                pay = _payment(tai)
-                episode.terminal_reward = (pay * 3.0 if seat == my_seat else -pay) * reward_scale
-                return _finalize()
-
-        # Discard: agent uses policy, AI uses heuristic
-        if seat == my_seat:
-            state_snap = _build_game_state(
-                my_hand, my_seat, prevailing_wind, wall_remaining, turn, opp_discards, opp_seats,
-            )
-            state_feat = extract_state_features(state_snap)
-            feat_t = torch.tensor(state_feat, dtype=torch.float32).unsqueeze(0)
-
-            with torch.no_grad():
-                logits, value_t = actor_critic(feat_t)
-
-            logits = logits.squeeze(0)
-            value = value_t.squeeze(0).item()
-
-            valid = torch.zeros(NTILES, dtype=torch.bool)
-            for t in range(NTILES):
-                if my_hand[t] > 0:
-                    valid[t] = True
-            logits[~valid] = -1e9
-
-            log_probs = F.log_softmax(logits, dim=-1)
-            probs = log_probs.exp()
-            action = torch.multinomial(probs, 1).item()
-            old_log_prob = log_probs[action].item()
-
-            discard = action
-            my_hand[discard] -= 1
-            h.concealed[discard] -= 1
+        discard_tile = action
+        my_hand[discard_tile] -= 1
+        my_sim.concealed[discard_tile] -= 1
 
             s_after = tiles_away(my_hand, 0)
             pr = tiles_away_reward * float(max(0, prev_tiles_away_val - s_after))
@@ -440,20 +422,93 @@ def collect_episode(
         if _check_ron(seat, discard):
             return _finalize()
 
-        # Pong check: AI opponents only
-        pong_seat = _find_pong_claimer(seat, discard)
-        if pong_seat is not None:
-            ph = sim_by_seat[pong_seat]
-            ph.concealed[discard] -= 2
-            ph.n_melds += 1
-            pong_discard = _heuristic_discard(ph)
-            ph.concealed[pong_discard] -= 1
-            opp_discards[opp_seat_to_idx[pong_seat]].append(pong_discard)
-            if _check_ron(pong_seat, pong_discard):
-                return _finalize()
-            # Next to draw: seat after the pong claimer
-            seat_cursor = all_seats.index(pong_seat) + 1
-        else:
+        # Claims: kong/pong (clockwise priority) then chow (left player only).
+        # Agent uses same heuristics as opponents; RL policy runs for post-claim discard.
+        seat_in_order = all_seats.index(seat)
+        claimed = False
+
+        for offset in range(1, n):
+            cs = all_seats[(seat_in_order + offset) % n]
+            ch = sim_by_seat[cs]
+
+            if ch.concealed[discard] >= 3 and _wants_kong_sim(ch, discard):
+                ch.concealed[discard] -= 3
+                ch.n_melds += 1
+                if cs == my_seat:
+                    my_hand[discard] -= 3
+                rep = None
+                while wall_idx < len(wall):
+                    if wall_remaining <= 15:
+                        return _finalize()
+                    rtid = wall[wall_idx]
+                    wall_idx += 1
+                    wall_remaining -= 1
+                    if rtid < 34:
+                        rep = rtid
+                        break
+                if rep is None:
+                    return _finalize()
+                ch.concealed[rep] += 1
+                if cs == my_seat:
+                    my_hand[rep] += 1
+                if ch.is_winner():
+                    tai = _estimate_tai(ch.concealed, ch.n_melds)
+                    if tai >= _MIN_TAI:
+                        _, zimo_pay = chip_payment(tai)
+                        net = zimo_pay * 3.0 if cs == my_seat else -zimo_pay
+                        episode.terminal_reward = net * reward_scale
+                        return _finalize()
+                if cs == my_seat:
+                    kong_disc = _run_agent_discard()
+                else:
+                    kong_disc = _heuristic_discard(ch)
+                    ch.concealed[kong_disc] -= 1
+                    opp_discards[opp_seat_to_idx[cs]].append(kong_disc)
+                if _check_ron(cs, kong_disc):
+                    return _finalize()
+                seat_cursor = all_seats.index(cs) + 1
+                claimed = True
+                break
+
+            elif ch.concealed[discard] >= 2 and _wants_pong_sim(ch, discard):
+                ch.concealed[discard] -= 2
+                ch.n_melds += 1
+                if cs == my_seat:
+                    my_hand[discard] -= 2
+                    pong_disc = _run_agent_discard()
+                else:
+                    pong_disc = _heuristic_discard(ch)
+                    ch.concealed[pong_disc] -= 1
+                    opp_discards[opp_seat_to_idx[cs]].append(pong_disc)
+                if _check_ron(cs, pong_disc):
+                    return _finalize()
+                seat_cursor = all_seats.index(cs) + 1
+                claimed = True
+                break
+
+        if not claimed:
+            left_cs = all_seats[(seat_in_order + 1) % n]
+            ch = sim_by_seat[left_cs]
+            chow = _pick_best_chow_sim(ch, discard)
+            if chow is not None:
+                for t in chow:
+                    if t != discard:
+                        ch.concealed[t] -= 1
+                        if left_cs == my_seat:
+                            my_hand[t] -= 1
+                ch.n_melds += 1
+                if left_cs == my_seat:
+                    chow_disc = _run_agent_discard()
+                else:
+                    chow_disc = _heuristic_discard(ch)
+                    ch.concealed[chow_disc] -= 1
+                    opp_discards[opp_seat_to_idx[left_cs]].append(chow_disc)
+                if _check_ron(left_cs, chow_disc):
+                    return _finalize()
+                seat_cursor = all_seats.index(left_cs) + 1
+                claimed = True
+
+        if not claimed:
             seat_cursor += 1
 
     return _finalize()

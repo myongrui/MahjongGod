@@ -4,6 +4,10 @@ Monte Carlo game simulator for Singapore Mahjong.
 Simulates complete games forward from the current state to estimate
 win and shoot probabilities for each candidate discard.
 
+Remaining simplifications vs the full engine:
+  - Tai is estimated (suit/dragon heuristic) rather than using the full scoring engine
+  - Agent never claims pong/kong/chow on opponent discards (only chooses what to discard)
+  - All players use the same pure-shanten discard heuristic
 V1 simplifications (to be refined in later phases):
   - No meld claiming during simulation (pong/chow from discards not modelled)
   - Simplified tai estimation for payment calculation
@@ -21,6 +25,8 @@ import numpy as np
 from cracked.tiles import NTILES, is_suited, is_honor, suit_of, DRAGON_START, DRAGON_END
 from cracked.game_state import GameState
 from cracked.tiles_away import tiles_away
+from cracked.shanten import shanten
+from cracked.scoring import chip_payment
 
 _MIN_TAI = 1  # minimum tai required to declare a win
 
@@ -144,6 +150,77 @@ def _payment(tai: int) -> float:
     return pow(2.0, tai - 1.0)
 
 
+def _wants_pong_sim(hand: SimHand, tile: int) -> bool:
+    """True if ponging maintains or improves best post-pong shanten."""
+    if hand.concealed[tile] < 2:
+        return False
+    current_s = shanten(hand.concealed, hand.n_melds)
+    if current_s == -1:
+        return False
+    hand.concealed[tile] -= 2
+    hand.n_melds += 1
+    eye = np.eye(NTILES, dtype=np.int8)
+    best_s = min(
+        (shanten(hand.concealed - eye[t], hand.n_melds)
+         for t in range(NTILES) if hand.concealed[t] > 0),
+        default=current_s,
+    )
+    hand.concealed[tile] += 2
+    hand.n_melds -= 1
+    return best_s <= current_s
+
+
+def _wants_kong_sim(hand: SimHand, tile: int) -> bool:
+    """True if konging doesn't significantly worsen shanten (+1 allowed; replacement compensates)."""
+    if hand.concealed[tile] < 3:
+        return False
+    current_s = shanten(hand.concealed, hand.n_melds)
+    if current_s == -1:
+        return False
+    hand.concealed[tile] -= 3
+    hand.n_melds += 1
+    eye = np.eye(NTILES, dtype=np.int8)
+    best_s = min(
+        (shanten(hand.concealed - eye[t], hand.n_melds)
+         for t in range(NTILES) if hand.concealed[t] > 0),
+        default=current_s,
+    )
+    hand.concealed[tile] += 3
+    hand.n_melds -= 1
+    return best_s <= current_s + 1
+
+
+def _pick_best_chow_sim(hand: SimHand, tile: int) -> Optional[tuple[int, int, int]]:
+    """Best chow option that strictly improves shanten, or None."""
+    if tile >= 27:
+        return None
+    suit_start = (tile // 9) * 9
+    rank = tile % 9
+    current_s = shanten(hand.concealed, hand.n_melds)
+    best_option: Optional[tuple[int, int, int]] = None
+    best_s = current_s  # chow requires strict improvement
+    eye = np.eye(NTILES, dtype=np.int8)
+    for low in (rank - 2, rank - 1, rank):
+        if low < 0 or low + 2 > 8:
+            continue
+        t1, t2, t3 = suit_start + low, suit_start + low + 1, suit_start + low + 2
+        if not all(hand.concealed[t] > 0 for t in (t1, t2, t3) if t != tile):
+            continue
+        test = hand.concealed.copy()
+        for t in (t1, t2, t3):
+            if t != tile:
+                test[t] -= 1
+        test_melds = hand.n_melds + 1
+        min_s = min(
+            (shanten(test - eye[t], test_melds) for t in range(NTILES) if test[t] > 0),
+            default=current_s,
+        )
+        if min_s < best_s:
+            best_s = min_s
+            best_option = (t1, t2, t3)
+    return best_option
+
+
 # ---------------------------------------------------------------------------
 # Hand dealing
 # ---------------------------------------------------------------------------
@@ -192,14 +269,15 @@ def _play_one_game(
     Simulate one complete game turn-by-turn until someone wins or wall empties.
 
     Players are ordered by seat wind (East first).
-    Pong/chow claiming is not modelled in V1 — players only win by self-draw
-    or from another player's discard.
+    Claims: pong/kong (clockwise priority) and chow (left player only).
+    Dead wall: stops at 15 tiles remaining, matching Singapore rules.
     """
     all_seats = sorted([my_seat] + [h.seat for h in opp_hands])
     hands: dict[int, SimHand] = {my_seat: my_hand}
     for h in opp_hands:
         hands[h.seat] = h
 
+    n = len(all_seats)
     wall_idx = 0
     max_rounds = 40  # Singapore games rarely exceed 30 rounds
 
