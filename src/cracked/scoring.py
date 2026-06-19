@@ -53,7 +53,7 @@ def chip_payment(tai: int) -> tuple[int, int]:
     """
     Returns (shooter_pay, zimo_pay_per_player) for the given tai level.
 
-    shooter_pay         — what the discarder pays to the winner (ron)
+    shooter_pay         — what the discarder pays to the winner (discard win)
     zimo_pay_per_player — what each opponent pays for a self-draw win
     """
     multiplier = 1 << max(tai - 1, 0)
@@ -188,8 +188,8 @@ def _is_limit_hand(hand: HandState, ctx: WinContext) -> Optional[str]:
     every_tile = all_tiles + exposed_tiles
 
     # Thirteen orphans
-    from cracked.shanten import shanten_thirteen_orphans
-    if not hand.melds and shanten_thirteen_orphans(concealed) == -1:
+    from cracked.tiles_away import tiles_away_thirteen_orphans
+    if not hand.melds and tiles_away_thirteen_orphans(concealed) == -1:
         return "Thirteen orphans (十三幺)"
 
     # All honors: every tile is wind or dragon
@@ -431,10 +431,10 @@ def calculate_tai(
         return TaiResult(total, base_bd + flower_bd, capped=True)
 
     # --- Seven pairs ---
-    from cracked.shanten import shanten_seven_pairs
+    from cracked.tiles_away import tiles_away_seven_pairs
     seven_pairs_total = -999
     seven_pairs_bd: list[tuple[str, int]] = []
-    if not hand.melds and shanten_seven_pairs(hand.concealed) == -1:
+    if not hand.melds and tiles_away_seven_pairs(hand.concealed) == -1:
         seven_pairs_total, seven_pairs_bd = _score_seven_pairs(hand, ctx, rules)
 
     # --- Standard form: find all decompositions ---

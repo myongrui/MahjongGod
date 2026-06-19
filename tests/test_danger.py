@@ -4,8 +4,9 @@ Tests for opponent_model.py and danger.py.
 Scenarios are constructed so the expected danger outcome is unambiguous:
   - Exhausted tiles are always safe
   - A tile in an opponent's flush suit is dangerous
-  - A tile the opponent discarded is safe
-  - Tenpai probability scales correctly with meld count
+  - A tile the opponent discarded is lower-danger but NOT hard-safe
+    (Singapore has no sacred-discard rule)
+  - Waiting probability scales correctly with meld count
   - Expected shooting cost is higher when facing a flush opponent
 """
 
@@ -16,7 +17,7 @@ from cracked.tiles import tile_id, Wind, DRAGON_START
 from cracked.hand import HandState, Meld, MeldType
 from cracked.game_state import GameState, PlayerView
 from cracked.opponent_model import (
-    OpponentModel, tenpai_probability, detect_suit_bias,
+    OpponentModel, waiting_probability, detect_suit_bias,
     model_opponent, model_all_opponents,
 )
 from cracked.danger import TileDanger, tile_danger_scores, expected_shooting_cost
@@ -50,27 +51,27 @@ def _pong_meld(name: str) -> Meld:
 
 
 # ---------------------------------------------------------------------------
-# tenpai_probability
+# waiting_probability
 # ---------------------------------------------------------------------------
 
-def test_tenpai_prob_no_melds_early_is_low():
-    assert tenpai_probability(0, 2) < 0.20
+def test_waiting_prob_no_melds_early_is_low():
+    assert waiting_probability(0, 2) < 0.20
 
 
-def test_tenpai_prob_three_melds_is_high():
-    assert tenpai_probability(3, 5) > 0.55
+def test_waiting_prob_three_melds_is_high():
+    assert waiting_probability(3, 5) > 0.55
 
 
-def test_tenpai_prob_increases_with_melds():
-    assert tenpai_probability(0, 0) < tenpai_probability(1, 0) < tenpai_probability(2, 0)
+def test_waiting_prob_increases_with_melds():
+    assert waiting_probability(0, 0) < waiting_probability(1, 0) < waiting_probability(2, 0)
 
 
-def test_tenpai_prob_increases_with_turns():
-    assert tenpai_probability(0, 0) < tenpai_probability(0, 15)
+def test_waiting_prob_increases_with_turns():
+    assert waiting_probability(0, 0) < waiting_probability(0, 15)
 
 
-def test_tenpai_prob_capped_below_one():
-    assert tenpai_probability(4, 50) <= 0.95
+def test_waiting_prob_capped_below_one():
+    assert waiting_probability(4, 50) <= 0.95
 
 
 # ---------------------------------------------------------------------------
@@ -135,12 +136,16 @@ def test_honor_bias_detected():
 # model_opponent — dangerous and safe tile sets
 # ---------------------------------------------------------------------------
 
-def test_discarded_tile_is_safe():
+def test_discarded_tile_not_hard_safe():
+    # Singapore has no sacred-discard rule: a thrown tile is strong
+    # evidence of safety but not a guarantee, so it is tracked separately from
+    # the hard-safe set rather than being added to it.
     state = _make_state()
     opp = state.opponent_by_seat(Wind.SOUTH)
     opp.discards = [tile_id("d5")]
     model = model_opponent(opp, state)
-    assert tile_id("d5") in model.safe_tiles
+    assert tile_id("d5") not in model.safe_tiles
+    assert tile_id("d5") in model.discarded_tiles
 
 
 def test_exhausted_tile_is_safe():
@@ -288,8 +293,8 @@ def test_expected_cost_higher_for_flush_opponent():
     assert cost_flush > cost_plain
 
 
-def test_expected_cost_increases_with_tenpai_prob():
-    # Late game (more turns) → higher tenpai prob → higher cost
+def test_expected_cost_increases_with_waiting_prob():
+    # Late game (more turns) → higher waiting prob → higher cost
     state_early = _make_state()
     state_early.turn_number = 1
     state_late = _make_state()
@@ -301,3 +306,70 @@ def test_expected_cost_increases_with_tenpai_prob():
     cost_early = expected_shooting_cost(tile_id("b5"), state_early, models_early)
     cost_late = expected_shooting_cost(tile_id("b5"), state_late, models_late)
     assert cost_late > cost_early
+
+
+# ---------------------------------------------------------------------------
+# No sacred-discard rule: a thrown tile is soft evidence, not hard-safe
+# ---------------------------------------------------------------------------
+
+def test_discarded_flush_tile_still_dangerous_no_furiten():
+    # Opponent throws b5 early, then commits to a bamboo (flush) hand. Without a
+    # sacred-discard rule, b5 can still be their winning tile, so it is not scored 0.0.
+    state = _make_state()
+    state.turn_number = 10
+    opp = state.opponent_by_seat(Wind.SOUTH)
+    opp.discards = [tile_id("b5")]
+    opp.melds = [Meld(MeldType.CHOW, (tile_id("b1"), tile_id("b2"), tile_id("b3")))]
+    models = model_all_opponents(state)
+    scores = tile_danger_scores(state, models)
+
+    assert scores[tile_id("b5")].score > 0.0          # no longer hard-safe
+    # ...but still safer than a same-suit tile they never discarded.
+    assert scores[tile_id("b5")].score < scores[tile_id("b7")].score
+
+
+# ---------------------------------------------------------------------------
+# Wall read / one-chance (Point 2)
+# ---------------------------------------------------------------------------
+
+def test_wall_wait_factor_honors_unaffected():
+    from cracked.danger import wall_wait_factor
+    visible = np.zeros(34, dtype=np.int8)
+    assert wall_wait_factor(tile_id("ew"), visible) == 1.0
+
+
+def test_wall_wait_factor_reduced_by_dead_neighbor():
+    from cracked.danger import wall_wait_factor
+    empty = np.zeros(34, dtype=np.int8)
+    walled = np.zeros(34, dtype=np.int8)
+    walled[tile_id("b5")] = 4  # all four b5 visible
+    # b4 is completed by shapes {b3,b5}, {b5,b6}, {b2,b3}; two need b5, now dead.
+    assert wall_wait_factor(tile_id("b4"), empty) == 1.0
+    assert wall_wait_factor(tile_id("b4"), walled) < 1.0
+
+
+def test_wall_read_lowers_adjacent_danger():
+    # b4 is a flush-suit danger tile. Exhausting b5 (all 4 seen) rules out the
+    # sequence shapes that need it, so b4's danger must drop.
+    def _b4_danger(exhaust_b5: bool) -> float:
+        state = _make_state()
+        state.turn_number = 10
+        if exhaust_b5:
+            state.my_hand.concealed[tile_id("b5")] = 4
+        opp = state.opponent_by_seat(Wind.SOUTH)
+        opp.melds = [Meld(MeldType.CHOW, (tile_id("b1"), tile_id("b2"), tile_id("b3")))]
+        models = model_all_opponents(state)
+        return tile_danger_scores(state, models)[tile_id("b4")].score
+
+    assert _b4_danger(exhaust_b5=True) < _b4_danger(exhaust_b5=False)
+
+
+# ---------------------------------------------------------------------------
+# Discard-tempo waiting signal (Point 5)
+# ---------------------------------------------------------------------------
+
+def test_waiting_prob_tempo_bump_from_late_middle_discards():
+    # Same meld count and turn; late middle-tile discards imply a settled hand.
+    quiet = [tile_id(n) for n in ["ew", "sw", "ww", "nw", "rd", "gd", "b1"]]
+    settled = [tile_id(n) for n in ["ew", "sw", "ww", "nw", "rd", "gd", "b5", "c5", "d5"]]
+    assert waiting_probability(0, 6, settled) > waiting_probability(0, 6, quiet)

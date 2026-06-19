@@ -63,8 +63,8 @@ def test_heuristic_discard_prefers_isolated_honor():
     assert tid == tile_id("nw")  # isolated north wind is the obvious drop
 
 
-def test_heuristic_discard_on_tenpai_hand():
-    # b1b2b3 c1c2c3 d1d2d3 ew-pong + rd (waiting for rd pair) — already tenpai
+def test_heuristic_discard_on_waiting_hand():
+    # b1b2b3 c1c2c3 d1d2d3 ew-pong + rd (waiting for rd pair) — already waiting
     # Heuristic must still return some tile (no crash)
     hand = _sim_hand("b1","b2","b3","c1","c2","c3","d1","d2","d3","ew","ew","ew","rd","gd")
     tid = _heuristic_discard(hand)
@@ -87,7 +87,7 @@ def test_sim_hand_is_winner_incomplete():
 
 
 def test_sim_hand_can_win_from_tile():
-    # Tenpai hand waiting for rd
+    # Waiting hand for rd
     hand = _sim_hand("b1","b2","b3","c1","c2","c3","d1","d2","d3","ew","ew","ew","rd")
     assert hand.can_win_from(tile_id("rd"))
     assert not hand.can_win_from(tile_id("gd"))
@@ -183,14 +183,14 @@ def test_simulate_raises_for_missing_tile():
 
 
 @pytest.mark.slow
-def test_near_tenpai_hand_higher_win_rate_than_random():
-    """A hand already at tenpai should win more often than a disorganised hand."""
-    state_tenpai = _make_state()
-    _set_hand(state_tenpai,
+def test_near_waiting_hand_higher_win_rate_than_random():
+    """A hand already at waiting should win more often than a disorganised hand."""
+    state_waiting = _make_state()
+    _set_hand(state_waiting,
         "b1","b2","b3","c1","c2","c3","d1","d2","d3",
         "ew","ew","ew","rd","gd")
-    sr_tenpai = simulate_from_state(
-        state_tenpai, tile_id("gd"), n_games=100, seed=7
+    sr_waiting = simulate_from_state(
+        state_waiting, tile_id("gd"), n_games=100, seed=7
     )
 
     state_bad = _make_state()
@@ -201,7 +201,7 @@ def test_near_tenpai_hand_higher_win_rate_than_random():
         state_bad, tile_id("rd"), n_games=100, seed=7
     )
 
-    assert sr_tenpai.win_rate >= sr_bad.win_rate
+    assert sr_waiting.win_rate >= sr_bad.win_rate
 
 
 # ---------------------------------------------------------------------------

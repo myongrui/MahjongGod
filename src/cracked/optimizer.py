@@ -6,18 +6,19 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from cracked.tiles import NTILES, WIND_START, WIND_END, DRAGON_START, DRAGON_END, suit_of
+from cracked.tiles import NTILES, WIND_START, WIND_END, DRAGON_START, DRAGON_END, suit_of, Wind
 from cracked.game_state import GameState
-from cracked.shanten import best_discards
+from cracked.tiles_away import best_discards
 from cracked.opponent_model import OpponentModel, model_all_opponents
 from cracked.danger import tile_danger_scores
+from cracked.scoring import STARTING_CHIPS
 
 
 @dataclass
 class DiscardRecommendation:
     """Full evaluation of one candidate discard."""
     tile_id: int
-    shanten_after: int
+    tiles_away_after: int
     weighted_acceptance: int    # tiles in unknown pool that improve hand if drawn
     shooting_cost: float        # E[payment in base units] if this tile is discarded
     danger_score: float         # P(at least one opponent wins from this discard)
@@ -26,8 +27,8 @@ class DiscardRecommendation:
     acceptance: dict[int, int]  # tile_id → remaining count that improve hand
 
 
-# How much tai-potential weight vs acceptance weight at each shanten level.
-# Closer to tenpai → hand structure is more locked in → tai matters more.
+# How much tai-potential weight vs acceptance weight at each tiles_away level.
+# Closer to waiting → hand structure is more locked in → tai matters more.
 _TAI_WEIGHT = {0: 0.45, 1: 0.30, 2: 0.20}
 
 
@@ -140,36 +141,75 @@ def hand_tai_potential(
 def adaptive_alpha(
     state: GameState,
     models: list[OpponentModel],
-    best_shanten: int,
+    best_tiles_away: int,
+    chip_lead: float = 0.0,
 ) -> float:
     """
     Compute α: weight on offensive vs defensive play (0=pure defence, 1=pure offence).
 
     Drivers that lower α (push toward safety):
-      - Opponents with high tenpai probability
+      - Opponents with high waiting probability
+      - A high-value (big-tai) waiting opponent — exponential, shooter-pays-all cost
       - Wall running thin
+      - A large chip lead worth protecting
     Drivers that raise α (push toward offence):
-      - Hand is close to tenpai
+      - Hand is close to waiting
+      - Being behind on chips (need variance)
+      - Sitting East (a win keeps the dealership)
+
+    chip_lead: (my chips − average opponent chips) / starting stack, clamped to
+    [-0.5, +0.5]. Defaults to 0 (no placement signal) for callers without chips.
     """
-    hand_factor = {-1: 0.85, 0: 0.75, 1: 0.60}.get(best_shanten, 0.45)
-    max_tenpai = max((m.tenpai_prob for m in models), default=0.0)
-    opp_factor = 1.0 - max_tenpai * 0.5
+    hand_factor = {-1: 0.85, 0: 0.75, 1: 0.60}.get(best_tiles_away, 0.45)
+    max_waiting = max((m.waiting_prob for m in models), default=0.0)
+    opp_factor = 1.0 - max_waiting * 0.5
+
+    # Threat-weighted defense: the most dangerous opponent's exponential payment
+    # (2^(tai-1)) collapses α — one big-tai deal-in dwarfs many small wins.
+    max_threat = max(
+        (m.waiting_prob * (2.0 ** (m.est_tai - 1.0)) for m in models), default=0.0
+    )
+    threat_factor = 1.0 / (1.0 + 0.15 * max_threat)
+
     wall_factor = min(state.wall_tiles_remaining / 80.0, 1.0)
-    alpha = hand_factor * opp_factor * wall_factor
+
+    # Placement: protect a lead (lower α), gamble when behind (raise α).
+    # A max lead halves the offensive weight; a max deficit raises it by 50%.
+    placement_factor = 1.0 - max(-0.5, min(0.5, chip_lead)) * 1.0
+    # East keeps the deal on a win, so values winning slightly more.
+    dealer_factor = 1.05 if state.my_seat == int(Wind.EAST) else 1.0
+
+    alpha = (hand_factor * opp_factor * threat_factor * wall_factor
+             * placement_factor * dealer_factor)
     return max(0.15, min(0.90, alpha))
 
 
-def recommend_discard(state: GameState) -> list[DiscardRecommendation]:
+def _chip_lead(my_chips: int | None, opponent_chips: list[int] | None) -> float:
+    """Normalised chip lead vs the average opponent, or 0.0 if chips unknown."""
+    if my_chips is None or not opponent_chips:
+        return 0.0
+    avg_opp = sum(opponent_chips) / len(opponent_chips)
+    return (my_chips - avg_opp) / STARTING_CHIPS
+
+
+def recommend_discard(
+    state: GameState,
+    my_chips: int | None = None,
+    opponent_chips: list[int] | None = None,
+) -> list[DiscardRecommendation]:
     """
     Rank every possible discard from a 14-tile hand by utility.
 
     Utility = α × offensive_score + (1−α) × defensive_score
       offensive_score: blend of normalized acceptance and tai potential
-                       (tai weight scales with shanten — heavier near tenpai)
+                       (tai weight scales with tiles_away — heavier near waiting)
       defensive_score: 1 − normalized shooting_cost
 
-    Primary sort key is shanten_after (lower is always better).
-    Utility resolves ties within the same shanten level.
+    Primary sort key is tiles_away_after (lower is always better).
+    Utility resolves ties within the same tiles_away level.
+
+    my_chips / opponent_chips (optional): current chip standings. When provided,
+    α becomes placement-aware — protect a lead, gamble when behind.
 
     Raises ValueError if the hand does not have exactly 14 concealed tiles
     (adjusted for exposed melds).
@@ -184,38 +224,39 @@ def recommend_discard(state: GameState) -> list[DiscardRecommendation]:
         )
 
     unknown = state.unknown_tiles()
-    shanten_results = best_discards(hand.concealed, unknown, n_melds)
-    if not shanten_results:
+    tiles_away_results = best_discards(hand.concealed, unknown, n_melds)
+    if not tiles_away_results:
         return []
 
     models = model_all_opponents(state)
     danger = tile_danger_scores(state, models)
 
-    best_shanten_val = shanten_results[0]["shanten_after"]
-    alpha = adaptive_alpha(state, models, best_shanten_val)
+    best_tiles_away_val = tiles_away_results[0]["tiles_away_after"]
+    chip_lead = _chip_lead(my_chips, opponent_chips)
+    alpha = adaptive_alpha(state, models, best_tiles_away_val, chip_lead)
 
-    # Tai weight: as shanten drops the hand structure becomes more locked in,
+    # Tai weight: as tiles_away drops the hand structure becomes more locked in,
     # so tai potential deserves more influence over acceptance count.
-    tai_w = _TAI_WEIGHT.get(best_shanten_val, 0.15)
+    tai_w = _TAI_WEIGHT.get(best_tiles_away_val, 0.15)
     acc_w = 1.0 - tai_w
 
     # Compute tai potential for each candidate (post-discard 13-tile hand).
     tai_pots = []
-    for r in shanten_results:
+    for r in tiles_away_results:
         mod = hand.concealed.copy()
         mod[r["tile_id"]] -= 1
         tai_pots.append(
             hand_tai_potential(mod, hand.melds, hand.seat_wind, state.prevailing_wind)
         )
 
-    acceptances = [r["weighted_acceptance"] for r in shanten_results]
-    costs = [danger[r["tile_id"]].expected_cost for r in shanten_results]
+    acceptances = [r["weighted_acceptance"] for r in tiles_away_results]
+    costs = [danger[r["tile_id"]].expected_cost for r in tiles_away_results]
     max_acc  = max(acceptances) if acceptances else 1
     max_cost = max(costs) if costs else 0.001
     max_tai  = max(tai_pots) if tai_pots else 1.0
 
     recommendations: list[DiscardRecommendation] = []
-    for r, tai_pot in zip(shanten_results, tai_pots):
+    for r, tai_pot in zip(tiles_away_results, tai_pots):
         tid = r["tile_id"]
         d = danger[tid]
         norm_acc    = r["weighted_acceptance"] / max(max_acc, 1)
@@ -227,7 +268,7 @@ def recommend_discard(state: GameState) -> list[DiscardRecommendation]:
 
         recommendations.append(DiscardRecommendation(
             tile_id=tid,
-            shanten_after=r["shanten_after"],
+            tiles_away_after=r["tiles_away_after"],
             weighted_acceptance=r["weighted_acceptance"],
             shooting_cost=round(d.expected_cost, 3),
             danger_score=round(d.score, 3),
@@ -236,5 +277,5 @@ def recommend_discard(state: GameState) -> list[DiscardRecommendation]:
             acceptance=r["acceptance"],
         ))
 
-    recommendations.sort(key=lambda x: (x.shanten_after, -x.utility))
+    recommendations.sort(key=lambda x: (x.tiles_away_after, -x.utility))
     return recommendations

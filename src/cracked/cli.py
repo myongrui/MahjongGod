@@ -15,7 +15,7 @@ from cracked.tiles import (
 )
 from cracked.hand import HandState, Meld, MeldType
 from cracked.game_state import GameState, PlayerView, save_state, load_state
-from cracked.shanten import shanten
+from cracked.tiles_away import tiles_away
 from cracked.optimizer import recommend_discard, adaptive_alpha
 from cracked.opponent_model import model_all_opponents
 
@@ -129,8 +129,8 @@ def set_hand(tiles):
     state.my_hand.concealed = arr
     save_state(state)
 
-    s = shanten(state.my_hand.concealed, len(state.my_hand.melds))
-    console.print(f"Hand set: {_render_hand(state.my_hand)}  |  Shanten: [bold]{s}[/bold]")
+    s = tiles_away(state.my_hand.concealed, len(state.my_hand.melds))
+    console.print(f"Hand set: {_render_hand(state.my_hand)}  |  Tiles away: [bold]{s}[/bold]")
 
 
 # ---------------------------------------------------------------------------
@@ -152,11 +152,11 @@ def draw_tile(tile: str):
     state.turn_number += 1
     save_state(state)
 
-    s = shanten(state.my_hand.concealed, len(state.my_hand.melds))
+    s = tiles_away(state.my_hand.concealed, len(state.my_hand.melds))
     console.print(
         f"Drew: {_rt(tid)}  |  "
         f"Hand ({state.my_hand.total_concealed} tiles): {_render_hand(state.my_hand)}  |  "
-        f"Shanten: [bold]{s}[/bold]"
+        f"Tiles away: [bold]{s}[/bold]"
     )
 
 
@@ -200,7 +200,7 @@ def discard_tile(tile: str, by: str):
 @click.option("--by", required=True,
               help="Who made the meld: 'me' or a seat name")
 @click.option("--concealed", is_flag=True, default=False,
-              help="Concealed kong (ankan)")
+              help="Concealed kong")
 def record_meld(meld_type: str, tiles, by: str, concealed: bool):
     """Record an exposed meld.  Example: cracked meld pong rd --by south"""
     state = load_state()
@@ -294,20 +294,20 @@ def recommend(deep: bool, games: int, log_file: str | None, model_path: str | No
         return
 
     models = model_all_opponents(state)
-    current_s = shanten(hand.concealed, len(hand.melds))
-    alpha = adaptive_alpha(state, models, results[0].shanten_after)
+    current_s = tiles_away(hand.concealed, len(hand.melds))
+    alpha = adaptive_alpha(state, models, results[0].tiles_away_after)
 
     table = Table(
         title=(
             f"Discard Recommendations  "
-            f"(shanten: {current_s}  |  α={alpha:.2f}  |  "
+            f"(tiles_away: {current_s}  |  α={alpha:.2f}  |  "
             f"wall: {state.wall_tiles_remaining})"
         ),
         box=box.ROUNDED, show_lines=False,
     )
     table.add_column("#", style="dim", width=3)
     table.add_column("Discard", width=7)
-    table.add_column("Shanten", justify="center", width=8)
+    table.add_column("Tiles away", justify="center", width=8)
     table.add_column("Tiles in", justify="center", width=8)
     table.add_column("Danger", justify="center", width=7)
     table.add_column("Cost", justify="center", width=6)
@@ -320,12 +320,12 @@ def recommend(deep: bool, games: int, log_file: str | None, model_path: str | No
         if len(accept_tiles) > 10:
             accept_str += f" [dim]+{len(accept_tiles)-10}[/dim]"
 
-        s_color = "green" if r.shanten_after <= 0 else ("yellow" if r.shanten_after == 1 else "white")
+        s_color = "green" if r.tiles_away_after <= 0 else ("yellow" if r.tiles_away_after == 1 else "white")
         d_color = "red" if r.danger_score > 0.3 else ("yellow" if r.danger_score > 0.1 else "green")
         table.add_row(
             str(i),
             _rt(r.tile_id),
-            f"[{s_color}]{r.shanten_after}[/{s_color}]",
+            f"[{s_color}]{r.tiles_away_after}[/{s_color}]",
             str(r.weighted_acceptance),
             f"[{d_color}]{r.danger_score:.2f}[/{d_color}]",
             f"{r.shooting_cost:.1f}",
@@ -336,11 +336,11 @@ def recommend(deep: bool, games: int, log_file: str | None, model_path: str | No
     console.print(table)
 
     best = results[0]
-    if best.shanten_after == -1:
+    if best.tiles_away_after == -1:
         console.print(f"[bold green]Complete hand![/bold green] Discard {_rt(best.tile_id)} to win.")
-    elif best.shanten_after == 0:
+    elif best.tiles_away_after == 0:
         console.print(
-            f"[bold green]Tenpai![/bold green] "
+            f"[bold green]Waiting![/bold green] "
             f"Best discard: {_rt(best.tile_id)}  |  "
             f"{best.weighted_acceptance} acceptance tiles  |  "
             f"Danger: {best.danger_score:.2f}"
@@ -348,7 +348,7 @@ def recommend(deep: bool, games: int, log_file: str | None, model_path: str | No
     else:
         console.print(
             f"Best discard: {_rt(best.tile_id)}  →  "
-            f"shanten {best.shanten_after}  |  "
+            f"tiles_away {best.tiles_away_after}  |  "
             f"{best.weighted_acceptance} acceptance tiles  |  "
             f"Danger: {best.danger_score:.2f}"
         )
@@ -475,7 +475,7 @@ def status():
     """Show the full current game state."""
     state = load_state()
     hand = state.my_hand
-    s = shanten(hand.concealed, len(hand.melds))
+    s = tiles_away(hand.concealed, len(hand.melds))
 
     console.rule("[bold]crackedMahjong[/bold]")
     console.print(
@@ -486,7 +486,7 @@ def status():
     )
     console.print()
 
-    console.print(f"[bold]Your hand[/bold]  (shanten: [bold]{s}[/bold])")
+    console.print(f"[bold]Your hand[/bold]  (tiles_away: [bold]{s}[/bold])")
     console.print(f"  {_render_hand(hand)}")
     if hand.flowers:
         console.print(f"  Flowers/Seasons: " + "  ".join(bonus_tile_name(f) for f in hand.flowers))

@@ -41,8 +41,8 @@ VARIANTS: dict[str, dict] = {
     "baseline": {
         "description": "Original reward system (no changes)",
         "gamma": 1.0,
-        "shanten_reward": 0.0,
-        "tenpai_bonus": 0.0,
+        "tiles_away_reward": 0.0,
+        "waiting_bonus": 0.0,
         "reward_scale": 1.0,
         "shaping_scale": SHAPING_SCALE,
         "defense_weight": DEFENSE_WEIGHT,
@@ -51,18 +51,18 @@ VARIANTS: dict[str, dict] = {
     "discount": {
         "description": "Add gamma=0.99 discounting only",
         "gamma": 0.99,
-        "shanten_reward": 0.0,
-        "tenpai_bonus": 0.0,
+        "tiles_away_reward": 0.0,
+        "waiting_bonus": 0.0,
         "reward_scale": 1.0,
         "shaping_scale": SHAPING_SCALE,
         "defense_weight": DEFENSE_WEIGHT,
         "ent_coef": ENT_COEF,
     },
-    "shanten_dense": {
-        "description": "Explicit per-step shanten-progress reward",
+    "tiles_away_dense": {
+        "description": "Explicit per-step tiles_away-progress reward",
         "gamma": 1.0,
-        "shanten_reward": 0.3,
-        "tenpai_bonus": 0.0,
+        "tiles_away_reward": 0.3,
+        "waiting_bonus": 0.0,
         "reward_scale": 1.0,
         "shaping_scale": SHAPING_SCALE,
         "defense_weight": DEFENSE_WEIGHT,
@@ -71,29 +71,29 @@ VARIANTS: dict[str, dict] = {
     "strong_shaping": {
         "description": "Higher shaping_scale + lower ent_coef",
         "gamma": 1.0,
-        "shanten_reward": 0.0,
-        "tenpai_bonus": 0.0,
+        "tiles_away_reward": 0.0,
+        "waiting_bonus": 0.0,
         "reward_scale": 1.0,
         "shaping_scale": 3.0,
         "defense_weight": DEFENSE_WEIGHT,
         "ent_coef": 0.001,
     },
     "full_fix": {
-        "description": "All improvements: discount + shanten + strong shaping",
+        "description": "All improvements: discount + tiles_away + strong shaping",
         "gamma": 0.99,
-        "shanten_reward": 0.3,
-        "tenpai_bonus": 0.0,
+        "tiles_away_reward": 0.3,
+        "waiting_bonus": 0.0,
         "reward_scale": 1.0,
         "shaping_scale": 3.0,
         "defense_weight": DEFENSE_WEIGHT,
         "ent_coef": 0.001,
     },
-    # --- new variants testing tenpai bonus and reward normalisation ---
-    "tenpai": {
-        "description": "One-time tenpai bonus (no normalization)",
+    # --- new variants testing waiting bonus and reward normalisation ---
+    "waiting": {
+        "description": "One-time waiting bonus (no normalization)",
         "gamma": 1.0,
-        "shanten_reward": 0.0,
-        "tenpai_bonus": 4.0,
+        "tiles_away_reward": 0.0,
+        "waiting_bonus": 4.0,
         "reward_scale": 1.0,
         "shaping_scale": SHAPING_SCALE,
         "defense_weight": DEFENSE_WEIGHT,
@@ -102,22 +102,33 @@ VARIANTS: dict[str, dict] = {
     "normalized": {
         "description": "Reward normalisation to [-1,+1] only",
         "gamma": 1.0,
-        "shanten_reward": 0.0,
-        "tenpai_bonus": 0.0,
+        "tiles_away_reward": 0.0,
+        "waiting_bonus": 0.0,
         "reward_scale": 1 / 48,
         "shaping_scale": SHAPING_SCALE,
         "defense_weight": DEFENSE_WEIGHT,
         "ent_coef": ENT_COEF,
     },
-    "normed_tenpai": {
-        "description": "Normalised + tenpai bonus + full_fix params",
+    "normed_waiting": {
+        "description": "Normalised + waiting bonus + full_fix params",
         "gamma": 0.99,
-        "shanten_reward": 0.3,
-        "tenpai_bonus": 4.0,
+        "tiles_away_reward": 0.3,
+        "waiting_bonus": 4.0,
         "reward_scale": 1 / 48,
         "shaping_scale": 3.0,
         "defense_weight": DEFENSE_WEIGHT,
         "ent_coef": 0.001,
+    },
+    "oracle_warmstart": {
+        "description": "Suphx-style oracle guiding: perfect-info shaping, annealed to 0",
+        "gamma": 0.99,
+        "tiles_away_reward": 0.0,
+        "waiting_bonus": 0.0,
+        "reward_scale": 1.0,
+        "shaping_scale": SHAPING_SCALE,
+        "defense_weight": DEFENSE_WEIGHT,
+        "ent_coef": ENT_COEF,
+        "oracle_coef": 1.0,
     },
 }
 
@@ -178,10 +189,11 @@ def run_experiments(
             "shaping_scale": cfg["shaping_scale"],
             "defense_weight": cfg["defense_weight"],
             "gamma": cfg["gamma"],
-            "shanten_reward": cfg["shanten_reward"],
-            "tenpai_bonus": cfg["tenpai_bonus"],
+            "tiles_away_reward": cfg["tiles_away_reward"],
+            "waiting_bonus": cfg["waiting_bonus"],
             "reward_scale": cfg["reward_scale"],
             "ent_coef": cfg["ent_coef"],
+            "oracle_coef": cfg.get("oracle_coef", 0.0),
             "resume": resume,
         })
 
@@ -270,7 +282,7 @@ def _cli() -> None:
         col = max(len(n) for n in VARIANTS) + 2
         for name, cfg in VARIANTS.items():
             print(f"  {name:<{col}} {cfg['description']}")
-            print(f"  {'':<{col}} gamma={cfg['gamma']}  shanten_reward={cfg['shanten_reward']}"
+            print(f"  {'':<{col}} gamma={cfg['gamma']}  tiles_away_reward={cfg['tiles_away_reward']}"
                   f"  shaping_scale={cfg['shaping_scale']}  ent_coef={cfg['ent_coef']}")
         print()
         return

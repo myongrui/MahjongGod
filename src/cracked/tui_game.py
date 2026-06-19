@@ -16,7 +16,7 @@ from textual.timer import Timer
 from cracked.tiles import tile_name, NTILES, Wind, bonus_tile_name, is_animal
 from cracked.engine import GameEngine, EventType, GameEvent
 from cracked.match import GameMatch, WIND_NAMES
-from cracked.shanten import shanten
+from cracked.tiles_away import tiles_away
 from cracked.scoring import calculate_tai, WinContext, DEFAULT_RULES
 
 # ---------------------------------------------------------------------------
@@ -147,7 +147,7 @@ def _waiting_tai_label(hand, prevailing_wind: int) -> str:
     for wt in range(NTILES):
         test = hand.concealed.copy()
         test[wt] += 1
-        if shanten(test, len(hand.melds)) == -1:
+        if tiles_away(test, len(hand.melds)) == -1:
             h = hand.copy()
             h.concealed[wt] += 1
             ctx = WinContext(winning_tile=wt, prevailing_wind=prevailing_wind)
@@ -436,7 +436,7 @@ class SpectatorScreen(Screen):
         discards_str = _discards_markup(player.discards)
         hand_str = _hand_markup(tiles, drawn)
         n_tiles = int(player.hand.concealed.sum())
-        s = shanten(player.hand.concealed, len(player.hand.melds))
+        s = tiles_away(player.hand.concealed, len(player.hand.melds))
         if s == -1:
             tai_label = "[bold green]Win![/bold green]"
         elif s == 0 and n_tiles == 13:
@@ -864,23 +864,23 @@ class InteractiveScreen(Screen):
             return
         player = self._engine.players[self._my_seat]
         tiles = player.hand.concealed_tiles_list()
-        s = shanten(player.hand.concealed, len(player.hand.melds))
+        s = tiles_away(player.hand.concealed, len(player.hand.melds))
         n_tiles = int(player.hand.concealed.sum())
         if s == -1:
-            shanten_str = "[bold green]win![/bold green]"
+            tiles_away_str = "[bold green]win![/bold green]"
         elif s == 0 and n_tiles == 13:
-            shanten_str = f"[yellow]{_waiting_tai_label(player.hand, self._engine.prevailing_wind)}[/yellow]"
+            tiles_away_str = f"[yellow]{_waiting_tai_label(player.hand, self._engine.prevailing_wind)}[/yellow]"
         elif s == 0:
-            shanten_str = "[yellow]waiting![/yellow]"
+            tiles_away_str = "[yellow]waiting![/yellow]"
         else:
-            shanten_str = str(s)
+            tiles_away_str = str(s)
         wall = self._engine.wall_remaining
         table_wind = SEAT_NAMES.get(self._engine.prevailing_wind, "?")
         my_chips = self._engine.chips.get(self._my_seat, 0)
         my_player_num = self._match.player_at.get(self._my_seat, "?") if self._match else "?"
         my_wind_name = WIND_NAMES.get(self._my_seat, "?")
         self.query_one("#hand-title", Label).update(
-            f"[bold]Player {my_player_num} — Your Hand ({my_wind_name})[/bold]  —  Tiles away: {shanten_str}"
+            f"[bold]Player {my_player_num} — Your Hand ({my_wind_name})[/bold]  —  Tiles away: {tiles_away_str}"
             f"  |  Wall: {wall}  Turn: {self._engine.turn_number}"
             f"  |  [yellow]★{my_chips}[/yellow]"
         )
@@ -924,7 +924,7 @@ class InteractiveScreen(Screen):
             table = self.query_one("#rec-table", DataTable)
             table.clear()
             for i, r in enumerate(recs[:8], 1):
-                s_str = "waiting" if r.shanten_after == 0 else ("win" if r.shanten_after == -1 else str(r.shanten_after))
+                s_str = "waiting" if r.tiles_away_after == 0 else ("win" if r.tiles_away_after == -1 else str(r.tiles_away_after))
                 table.add_row(
                     str(i),
                     f"{tile_glyph(r.tile_id)} {tile_name(r.tile_id).upper()}",

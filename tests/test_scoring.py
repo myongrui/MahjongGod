@@ -1,7 +1,7 @@
 """
 Scoring tests for Singapore Mahjong tai (台) engine.
 
-All hands are complete winning hands (shanten = -1).
+All hands are complete winning hands (tiles_away = -1).
 """
 
 import pytest

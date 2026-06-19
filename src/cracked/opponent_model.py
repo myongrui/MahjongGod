@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
@@ -18,19 +18,51 @@ from cracked.game_state import GameState, PlayerView
 class OpponentModel:
     """Observable inference about one opponent's hand and danger profile."""
     seat: int
-    tenpai_prob: float           # estimated probability opponent is tenpai (0–1)
+    waiting_prob: float           # estimated probability opponent is waiting (0–1)
     est_tai: float               # estimated tai value if they win
     suit_bias: Optional[int]     # suspected flush suit: 0=bamboo, 1=chars, 2=circles
     honor_bias: bool             # opponent appears to be collecting honors
-    dangerous_tiles: set[int]    # tile IDs likely to complete their hand
-    safe_tiles: set[int]         # tile IDs unlikely to be wanted by them
+    dangerous_tiles: set[int] = field(default_factory=set)    # tile IDs likely to complete their hand
+    safe_tiles: set[int] = field(default_factory=set)         # tiles certain NOT to win (all 4 seen / ponged 4th copy)
+    discarded_tiles: set[int] = field(default_factory=set)    # tiles they have thrown — strong but soft evidence of safety
 
 
-def tenpai_probability(n_melds: int, turn: int) -> float:
-    """Heuristic tenpai estimate from meld count and turn number."""
+def _discard_tempo_bump(discards: list[int]) -> float:
+    """
+    Bayesian waiting-probability bump from discard tempo (Singapore has no
+    declared-ready signal, so tempo is one of the few waiting tells).
+
+    Signals:
+      - Late discards of middle suited tiles (ranks 4–6): middle tiles are the
+        most useful for sequences, so cutting them late suggests a settled hand.
+      - Suit dump: the last four suited discards all share one suit, which
+        implies the hand has committed and is shedding a now-useless suit.
+    """
+    if len(discards) < 6:
+        return 0.0
+    bump = 0.0
+    late = discards[6:]
+    mids = sum(1 for t in late if is_suited(t) and (t % 9) in (3, 4, 5))
+    bump += min(0.04 * mids, 0.18)
+    last4 = [t for t in discards[-4:] if is_suited(t)]
+    if len(last4) == 4 and len({suit_of(t) for t in last4}) == 1:
+        bump += 0.05
+    return bump
+
+
+def waiting_probability(n_melds: int, turn: int, discards: Optional[list[int]] = None) -> float:
+    """
+    Heuristic waiting estimate from meld count, turn number, and discard tempo.
+
+    discards (optional): the opponent's discard pile, used for tempo signals that
+    nudge the estimate up when their throws suggest a settled, near-complete hand.
+    """
     base = [0.05, 0.12, 0.28, 0.60, 0.90][min(n_melds, 4)]
     pressure = min(turn * 0.007, 0.30)
-    return min(base + pressure, 0.95)
+    p = base + pressure
+    if discards:
+        p += _discard_tempo_bump(discards)
+    return min(p, 0.95)
 
 
 def detect_suit_bias(opp: PlayerView) -> tuple[Optional[int], bool]:
@@ -222,19 +254,24 @@ def _compute_tile_sets(
     prevailing_wind: int,
     honor_bias: bool,
 ) -> tuple[set[int], set[int]]:
-    """Compute (dangerous, safe) tile sets for one opponent."""
+    """
+    Compute (dangerous, safe) tile sets for one opponent.
+
+    Note: a tile the opponent previously discarded is NOT treated as hard-safe.
+    Singapore Mahjong has no sacred-discard rule, so they can still
+    win on a tile they once threw if their wait has since changed. Discards are
+    tracked separately (see model_opponent.discarded_tiles) as soft evidence.
+    Only tiles certain not to win — all 4 copies visible, or the 4th copy of a
+    ponged/konged honor — go into the hard-safe set.
+    """
     dangerous: set[int] = set()
     safe: set[int] = set()
-    discarded = set(opp.discards)
 
     dragon_dangerous, dragon_safe = _dragon_danger_flags(opp, visible)
     wind_dangerous, wind_safe = _wind_danger_flags(opp, visible, prevailing_wind, honor_bias)
 
     for tid in range(NTILES):
         if visible[tid] >= 4:
-            safe.add(tid)
-            continue
-        if tid in discarded:
             safe.add(tid)
             continue
         if tid in dragon_safe or tid in wind_safe:
@@ -259,17 +296,18 @@ def model_opponent(opp: PlayerView, state: GameState) -> OpponentModel:
     dangerous, safe = _compute_tile_sets(
         opp, suit_bias, visible, state.prevailing_wind, honor_bias
     )
-    tp = tenpai_probability(len(opp.melds), state.turn_number)
+    tp = waiting_probability(len(opp.melds), state.turn_number, opp.discards)
     est_tai = _estimate_tai(opp, suit_bias, state.prevailing_wind)
 
     return OpponentModel(
         seat=opp.seat,
-        tenpai_prob=tp,
+        waiting_prob=tp,
         est_tai=est_tai,
         suit_bias=suit_bias,
         honor_bias=honor_bias,
         dangerous_tiles=dangerous,
         safe_tiles=safe,
+        discarded_tiles=set(opp.discards),
     )
 
 

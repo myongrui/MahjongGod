@@ -9,7 +9,7 @@ from textual import work
 from cracked.tiles import tile_id, tile_name, new_hand_array, NTILES, Wind
 from cracked.hand import HandState
 from cracked.game_state import GameState, PlayerView
-from cracked.shanten import shanten
+from cracked.tiles_away import tiles_away
 from cracked.optimizer import recommend_discard
 from cracked.simulator import run_simulation
 
@@ -222,7 +222,7 @@ class CrackedMahjongApp(App):
         if state is None:
             return
 
-        s = shanten(state.my_hand.concealed, 0)
+        s = tiles_away(state.my_hand.concealed, 0)
         tiles_flat = [t for t in range(NTILES) for _ in range(int(state.my_hand.concealed[t]))]
         hand_str = " ".join(tile_name(t) for t in tiles_flat)
         self.query_one("#hand-display", Label).update(f"{hand_str}  |  Tiles away: {s}")
@@ -242,17 +242,17 @@ class CrackedMahjongApp(App):
             if len(r.acceptance) > 5:
                 accept_str += f" +{len(r.acceptance) - 5}"
 
-            if r.shanten_after == -1:
-                shanten_str = "win!"
-            elif r.shanten_after == 0:
-                shanten_str = "waiting"
+            if r.tiles_away_after == -1:
+                tiles_away_str = "win!"
+            elif r.tiles_away_after == 0:
+                tiles_away_str = "waiting"
             else:
-                shanten_str = str(r.shanten_after)
+                tiles_away_str = str(r.tiles_away_after)
 
             rec_table.add_row(
                 str(i),
                 tile_name(r.tile_id),
-                shanten_str,
+                tiles_away_str,
                 str(r.weighted_acceptance),
                 f"{r.danger_score:.2f}",
                 f"{r.shooting_cost:.2f}",
@@ -262,9 +262,9 @@ class CrackedMahjongApp(App):
 
         if recs:
             best = recs[0]
-            if best.shanten_after == -1:
+            if best.tiles_away_after == -1:
                 self._set_status(f"Win! Discard {tile_name(best.tile_id)}")
-            elif best.shanten_after == 0:
+            elif best.tiles_away_after == 0:
                 self._set_status(
                     f"Waiting! Best: {tile_name(best.tile_id)} — "
                     f"{best.weighted_acceptance} acceptance tiles"
@@ -272,7 +272,7 @@ class CrackedMahjongApp(App):
             else:
                 self._set_status(
                     f"Best: {tile_name(best.tile_id)} → "
-                    f"tiles away {best.shanten_after}, {best.weighted_acceptance} accepts"
+                    f"tiles away {best.tiles_away_after}, {best.weighted_acceptance} accepts"
                 )
 
     def action_simulate(self) -> None:

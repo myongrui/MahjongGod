@@ -28,7 +28,7 @@ from cracked.simulator import (
     SimHand, _heuristic_discard, _estimate_tai, _payment, _MIN_TAI,
 )
 from cracked.optimizer import hand_tai_potential
-from cracked.shanten import shanten
+from cracked.tiles_away import tiles_away
 from cracked.danger import expected_shooting_cost
 from cracked.opponent_model import model_all_opponents
 from cracked.training.features import N_STATE_FEATURES, extract_state_features
@@ -54,21 +54,41 @@ def _compute_potential(
     """
     State potential for PBRS (potential-based reward shaping).
 
-    Combines shanten proximity and tai ceiling so the agent receives a
+    Combines tiles_away proximity and tai ceiling so the agent receives a
     dense learning signal at every step rather than only at game end.
     """
-    s = shanten(concealed, n_melds)
-    shanten_val = (7 - s) / 8.0
+    s = tiles_away(concealed, n_melds)
+    tiles_away_val = (7 - s) / 8.0
     tai_pot = hand_tai_potential(concealed, [], seat_wind, prevailing_wind)
     tai_val = min(tai_pot / 6.0, 1.0)
-    return 1.5 * shanten_val + 1.0 * tai_val
+    return 1.5 * tiles_away_val + 1.0 * tai_val
+
+
+def oracle_threat(opp_sims: list) -> float:
+    """
+    Privileged perfect-information threat in [0, 1]: how close the closest
+    opponent is to a complete hand, read from their actual concealed tiles.
+
+    Used for Suphx-style oracle guiding: early in training the agent gets a
+    perfect-information caution signal (opponents are dangerous *right now*),
+    which is annealed to zero so the final policy relies only on observable
+    state. A waiting opponent (tiles_away 0) returns 1.0; further away decays.
+    """
+    best = 99
+    for h in opp_sims:
+        s = tiles_away(h.concealed, h.n_melds)
+        if s < best:
+            best = s
+    if best >= 99:
+        return 0.0
+    return 1.0 / (1.0 + max(best, 0))
 
 
 def _wants_pong(hand: SimHand, tile: int) -> bool:
-    """True if claiming a pong of tile maintains or improves best post-pong shanten."""
+    """True if claiming a pong of tile maintains or improves best post-pong tiles_away."""
     if hand.concealed[tile] < 2:
         return False
-    s_before = shanten(hand.concealed, hand.n_melds)
+    s_before = tiles_away(hand.concealed, hand.n_melds)
     hand.concealed[tile] -= 2
     hand.n_melds += 1
     best_s = 99
@@ -76,7 +96,7 @@ def _wants_pong(hand: SimHand, tile: int) -> bool:
         if hand.concealed[t] == 0:
             continue
         hand.concealed[t] -= 1
-        s = shanten(hand.concealed, hand.n_melds)
+        s = tiles_away(hand.concealed, hand.n_melds)
         hand.concealed[t] += 1
         if s < best_s:
             best_s = s
@@ -195,7 +215,7 @@ class Step:
     value_pred: float        # value estimate at this state
     potential: float = 0.0          # state potential φ(s) for PBRS reward shaping
     discard_reward: float = 0.0     # immediate defense penalty: −DEFENSE_WEIGHT × expected_cost
-    progress_reward: float = 0.0    # shanten-progress reward: +shanten_reward per shanten step gained
+    progress_reward: float = 0.0    # tiles_away-progress reward: +tiles_away_reward per tiles_away step gained
 
 
 @dataclass
@@ -268,14 +288,15 @@ def collect_episode(
     prevailing_wind: int = Wind.EAST,
     shaping_scale: float = SHAPING_SCALE,
     defense_weight: float = DEFENSE_WEIGHT,
-    shanten_reward: float = 0.0,
-    tenpai_bonus: float = 0.0,
+    tiles_away_reward: float = 0.0,
+    waiting_bonus: float = 0.0,
     reward_scale: float = 1.0,
+    oracle_coef: float = 0.0,
 ) -> Episode:
     """
     Play one game: learning agent (actor_critic) vs three heuristic AI opponents.
 
-    AI opponents will claim pongs when it maintains or improves their shanten.
+    AI opponents will claim pongs when it maintains or improves their tiles_away.
     The agent does not auto-pong — it only decides what to discard on its draw.
     Wall stops at 15 tiles remaining, matching the real game dead-wall rule.
     """
@@ -298,8 +319,8 @@ def collect_episode(
     my_hand = my_concealed.copy()
     opp_discards: list[list[int]] = [[], [], []]
     opp_seat_to_idx = {seat: i for i, seat in enumerate(opp_seats)}
-    prev_shanten_val = shanten(my_hand, 0)  # tracks 13-tile shanten between agent turns
-    tenpai_reached = False  # fires tenpai_bonus only once per game
+    prev_tiles_away_val = tiles_away(my_hand, 0)  # tracks 13-tile tiles_away between agent turns
+    waiting_reached = False  # fires waiting_bonus only once per game
 
     episode = Episode()
     wall_idx = 0
@@ -312,7 +333,7 @@ def collect_episode(
         return episode
 
     def _check_ron(discarder: int, discard: int) -> bool:
-        """Ron check after a discard. Sets terminal_reward and returns True if game over."""
+        """Discard-win check after a discard. Sets terminal_reward and returns True if game over."""
         for claimer_seat in all_seats:
             if claimer_seat == discarder:
                 continue
@@ -393,25 +414,29 @@ def collect_episode(
             my_hand[discard] -= 1
             h.concealed[discard] -= 1
 
-            s_after = shanten(my_hand, 0)
-            pr = shanten_reward * float(max(0, prev_shanten_val - s_after))
-            if not tenpai_reached and s_after == 0:
-                tenpai_reached = True
-                pr += tenpai_bonus
+            s_after = tiles_away(my_hand, 0)
+            pr = tiles_away_reward * float(max(0, prev_tiles_away_val - s_after))
+            if not waiting_reached and s_after == 0:
+                waiting_reached = True
+                pr += waiting_bonus
             pr *= reward_scale
-            prev_shanten_val = s_after
+            prev_tiles_away_val = s_after
 
             pot = _compute_potential(my_hand, 0, my_seat, prevailing_wind)
             opp_models = model_all_opponents(state_snap)
             cost = expected_shooting_cost(discard, state_snap, opp_models)
             dr = -defense_weight * cost * reward_scale
+            # Oracle guiding: privileged perfect-information caution signal,
+            # annealed to zero over training by the caller (oracle_coef → 0).
+            if oracle_coef > 0.0:
+                dr += -oracle_coef * oracle_threat(opp_sims) * reward_scale
             episode.steps.append(Step(state_feat, action, old_log_prob, value, pot, dr, pr))
         else:
             discard = _heuristic_discard(h)
             h.concealed[discard] -= 1
             opp_discards[opp_seat_to_idx[seat]].append(discard)
 
-        # Ron check
+        # Discard-win check
         if _check_ron(seat, discard):
             return _finalize()
 
@@ -455,7 +480,7 @@ def ppo_update(
     Computes discounted returns backwards from the terminal reward.  At each
     step the shaped reward combines three signals:
       1. discard_reward: immediate defense penalty.
-      2. progress_reward: per-step shanten-improvement bonus.
+      2. progress_reward: per-step tiles_away-improvement bonus.
       3. PBRS: γ·φ(s_{t+1}) − φ(s_t) — telescopes to the end-of-episode
          potential gain, weighted by shaping_scale.
 
@@ -588,16 +613,21 @@ def train_self_play(
     defense_weight: float = DEFENSE_WEIGHT,
     resume: bool = False,
     gamma: float = 1.0,
-    shanten_reward: float = 0.0,
-    tenpai_bonus: float = 0.0,
+    tiles_away_reward: float = 0.0,
+    waiting_bonus: float = 0.0,
     reward_scale: float = 1.0,
     ent_coef: float = ENT_COEF,
+    oracle_coef: float = 0.0,
 ) -> dict:
     """
     Train ActorCritic via self-play against heuristic opponents.
 
-    Uses potential-based reward shaping (PBRS) derived from shanten
+    Uses potential-based reward shaping (PBRS) derived from tiles_away
     proximity and tai-potential to give the agent dense learning signal.
+
+    oracle_coef > 0 enables Suphx-style oracle guiding: a privileged
+    perfect-information caution signal that is linearly annealed from oracle_coef
+    to 0 across training, so the final policy depends only on observable state.
 
     Saves the best checkpoint (by mean_net in evaluation) to model_path.
     Pass resume=True to continue from an existing checkpoint at model_path.
@@ -628,7 +658,7 @@ def train_self_play(
             f"Training for {n_episodes} episodes, "
             f"batch={episodes_per_update}, shaping={shaping_scale}, "
             f"defense={defense_weight}, gamma={gamma}, "
-            f"shanten_reward={shanten_reward}, tenpai_bonus={tenpai_bonus}, "
+            f"tiles_away_reward={tiles_away_reward}, waiting_bonus={waiting_bonus}, "
             f"reward_scale={reward_scale}, ent_coef={ent_coef}"
         )
 
@@ -636,10 +666,13 @@ def train_self_play(
 
     for ep_num in range(1, n_episodes + 1):
         ep_seat = rng.choice(_WINDS)  # train from all seats equally
+        # Anneal oracle guiding linearly from oracle_coef → 0 over training.
+        cur_oracle = oracle_coef * max(0.0, 1.0 - (ep_num - 1) / max(n_episodes - 1, 1))
         episode_buffer.append(
             collect_episode(model, rng, my_seat=ep_seat, shaping_scale=shaping_scale,
-                            defense_weight=defense_weight, shanten_reward=shanten_reward,
-                            tenpai_bonus=tenpai_bonus, reward_scale=reward_scale)
+                            defense_weight=defense_weight, tiles_away_reward=tiles_away_reward,
+                            waiting_bonus=waiting_bonus, reward_scale=reward_scale,
+                            oracle_coef=cur_oracle)
         )
 
         if len(episode_buffer) >= episodes_per_update:
@@ -701,14 +734,16 @@ def _cli():
                         help="Defense penalty weight per step (0 = off)")
     parser.add_argument("--gamma", type=float, default=1.0,
                         help="Discount factor for returns (1.0 = no discounting)")
-    parser.add_argument("--shanten-reward", type=float, default=0.0,
-                        help="Per-step reward for each shanten improvement")
-    parser.add_argument("--tenpai-bonus", type=float, default=0.0,
-                        help="One-time reward the first time the agent reaches tenpai in a game")
+    parser.add_argument("--tiles-away-reward", type=float, default=0.0,
+                        help="Per-step reward for each tiles_away improvement")
+    parser.add_argument("--waiting-bonus", type=float, default=0.0,
+                        help="One-time reward the first time the agent reaches waiting in a game")
     parser.add_argument("--reward-scale", type=float, default=1.0,
                         help="Scale all rewards by this factor (e.g. 1/48 normalises to [-1,+1])")
     parser.add_argument("--ent-coef", type=float, default=ENT_COEF,
                         help="Entropy coefficient in PPO loss")
+    parser.add_argument("--oracle-coef", type=float, default=0.0,
+                        help="Oracle-guiding strength, annealed to 0 over training (0 = off)")
     parser.add_argument("--resume", action="store_true",
                         help="Continue training from existing checkpoint at --out path")
     args = parser.parse_args()
@@ -723,10 +758,11 @@ def _cli():
         shaping_scale=args.shaping_scale,
         defense_weight=args.defense_weight,
         gamma=args.gamma,
-        shanten_reward=args.shanten_reward,
-        tenpai_bonus=args.tenpai_bonus,
+        tiles_away_reward=args.tiles_away_reward,
+        waiting_bonus=args.waiting_bonus,
         reward_scale=args.reward_scale,
         ent_coef=args.ent_coef,
+        oracle_coef=args.oracle_coef,
         resume=args.resume,
     )
 

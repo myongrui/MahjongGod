@@ -56,7 +56,7 @@ cracked draw gd
 cracked recommend
 ```
 
-The heuristic table shows shanten, acceptance tile count, danger score, and shooting cost for each candidate discard.
+The heuristic table shows tiles away, acceptance tile count, danger score, and shooting cost for each candidate discard.
 
 ### 5. Record your discard
 
@@ -93,7 +93,7 @@ cracked status
 cracked recommend
 ```
 
-Ranks discards by shanten reduction, acceptance tile count, and danger score. Runs instantly.
+Ranks discards by tiles-away reduction, acceptance tile count, and danger score. Runs instantly.
 
 ### Monte Carlo simulation (`--deep`)
 
@@ -132,7 +132,7 @@ cracked-play
 
 ### Advisor mode (`cracked-ui`)
 
-Enter any 13-tile hand and a draw tile. Press **R** to get ranked discard recommendations (shanten, acceptance tiles, danger score, utility). Press **S** to run Monte Carlo simulation. Use the seat and prevailing wind dropdowns.
+Enter any 13-tile hand and a draw tile. Press **R** to get ranked discard recommendations (tiles away, acceptance tiles, danger score, utility). Press **S** to run Monte Carlo simulation. Use the seat and prevailing wind dropdowns.
 
 ### Game viewer (`cracked-play`)
 
@@ -186,8 +186,8 @@ The policy trains from all four seat positions (East/South/West/North) against t
 | Flag | Default | Description |
 |---|---|---|
 | `--gamma` | `1.0` | Discount factor for returns (`0.99` = standard discounting) |
-| `--shanten-reward` | `0.0` | Per-step reward for each shanten improvement |
-| `--tenpai-bonus` | `0.0` | One-time reward the first time the agent reaches tenpai in a game |
+| `--tiles-away-reward` | `0.0` | Per-step reward for each tiles-away improvement |
+| `--waiting-bonus` | `0.0` | One-time reward the first time the agent reaches waiting in a game |
 | `--reward-scale` | `1.0` | Multiply all rewards by this factor (`0.0208` ≈ `1/48` normalises to `[-1, +1]`) |
 | `--ent-coef` | `0.01` | Entropy coefficient in the PPO loss |
 | `--shaping-scale` | `1.0` | PBRS potential-shaping weight |
@@ -204,7 +204,7 @@ python -m cracked.training.experiment --list
 python -m cracked.training.experiment --episodes 10000
 
 # Run specific variants
-python -m cracked.training.experiment tenpai normalized normed_tenpai --episodes 10000
+python -m cracked.training.experiment waiting normalized normed_waiting --episodes 10000
 
 # Cap parallel workers (useful on machines with fewer cores)
 python -m cracked.training.experiment --episodes 10000 --workers 2
@@ -219,12 +219,12 @@ Built-in variants:
 |---|---|
 | `baseline` | Original reward system |
 | `discount` | `gamma=0.99` discounting only |
-| `shanten_dense` | Per-step shanten-progress reward |
+| `tiles_away_dense` | Per-step tiles-away-progress reward |
 | `strong_shaping` | Higher `shaping_scale` + lower `ent_coef` |
-| `full_fix` | Discount + shanten reward + strong shaping |
-| `tenpai` | One-time tenpai bonus (no normalisation) |
+| `full_fix` | Discount + tiles-away reward + strong shaping |
+| `waiting` | One-time waiting bonus (no normalisation) |
 | `normalized` | Reward normalisation to `[-1, +1]` only |
-| `normed_tenpai` | Normalised + tenpai bonus + `full_fix` params |
+| `normed_waiting` | Normalised + waiting bonus + `full_fix` params |
 
 Each variant saves its model to `models/{variant_name}.pt`. Add new variants by editing the `VARIANTS` dict at the top of `src/cracked/training/experiment.py`.
 
@@ -237,10 +237,10 @@ Each variant saves its model to `models/{variant_name}.pt`. Add new variants by 
 python -m pytest tests/ -v
 
 # Run a specific module
-python -m pytest tests/test_shanten.py -v
+python -m pytest tests/test_tiles_away.py -v
 
 # Run a specific test
-python -m pytest tests/test_shanten.py::test_tenpai_single_wait -v
+python -m pytest tests/test_tiles_away.py::test_waiting_single_wait -v
 
 # Include slow tests (full game simulations, ~30–60s extra)
 python -m pytest -m slow -v
@@ -254,14 +254,14 @@ python -m pytest tests/ -m "" -v
 | File | What it covers |
 |---|---|
 | `test_tiles.py` | Tile encoding, name parsing, bonus tiles |
-| `test_shanten.py` | Shanten calculator (standard, seven pairs, thirteen orphans) |
+| `test_tiles_away.py` | Tiles-away calculator (standard, seven pairs, thirteen orphans) |
 | `test_scoring.py` | Tai scoring engine, limit hands, flowers/animals |
 | `test_danger.py` | Danger scoring, safe tile identification |
 | `test_game_state.py` | GameState, PlayerView, visible/unknown tile tracking |
 | `test_optimizer.py` | Discard recommendations, adaptive alpha, utility scoring |
 | `test_cli.py` | All CLI commands via Click's CliRunner |
 | `test_simulator.py` | Monte Carlo simulator, SimHand, game results |
-| `test_features.py` | ML feature vector extraction (252-dim and 217-dim) |
+| `test_features.py` | ML feature vector extraction (230-dim state and 265-dim candidate vectors) |
 | `test_training_data.py` | JSONL log recording and dataset loading |
 | `test_self_play.py` | ActorCritic network, episode collection, PPO update, tournament |
 
@@ -275,11 +275,11 @@ The `test_self_play.py` torch-dependent tests skip automatically if PyTorch is n
 src/cracked/
 ├── tiles.py           # Tile encoding and constants
 ├── hand.py            # HandState, Meld, MeldType
-├── shanten.py         # Shanten calculator + acceptance count
+├── tiles_away.py      # Tiles-away calculator + acceptance count
 ├── scoring.py         # Singapore tai scoring engine
 ├── game_state.py      # GameState, PlayerView, save/load
 ├── danger.py          # Tile danger scoring
-├── opponent_model.py  # Opponent tenpai/flush inference
+├── opponent_model.py  # Opponent waiting/flush inference
 ├── optimizer.py       # Heuristic discard recommendations
 ├── simulator.py       # Monte Carlo game simulator
 ├── cli.py             # Click CLI (cracked)

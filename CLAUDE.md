@@ -1,6 +1,64 @@
 # CLAUDE.md
+1. Think Before Coding
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Don't assume. Don't hide confusion. Surface tradeoffs.
+
+Before implementing:
+
+    State your assumptions explicitly. If uncertain, ask.
+    If multiple interpretations exist, present them - don't pick silently.
+    If a simpler approach exists, say so. Push back when warranted.
+    If something is unclear, stop. Name what's confusing. Ask.
+
+2. Simplicity First
+
+Minimum code that solves the problem. Nothing speculative.
+
+    No features beyond what was asked.
+    No abstractions for single-use code.
+    No "flexibility" or "configurability" that wasn't requested.
+    No error handling for impossible scenarios.
+    If you write 200 lines and it could be 50, rewrite it.
+
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+3. Surgical Changes
+
+Touch only what you must. Clean up only your own mess.
+
+When editing existing code:
+
+    Don't "improve" adjacent code, comments, or formatting.
+    Don't refactor things that aren't broken.
+    Match existing style, even if you'd do it differently.
+    If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+
+    Remove imports/variables/functions that YOUR changes made unused.
+    Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+4. Goal-Driven Execution
+
+Define success criteria. Loop until verified.
+
+Transform tasks into verifiable goals:
+
+    "Add validation" → "Write tests for invalid inputs, then make them pass"
+    "Fix the bug" → "Write a test that reproduces it, then make it pass"
+    "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+
+These guidelines are working if: fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+The following provides guidance to Claude Code when working with code in this repository.
 
 ## Commands
 
@@ -18,10 +76,10 @@ pip install -e ".[dev,ui]"
 python -m pytest tests/ -v
 
 # Run a single test file
-python -m pytest tests/test_shanten.py -v
+python -m pytest tests/test_tiles_away.py -v
 
 # Run a specific test
-python -m pytest tests/test_shanten.py::test_tenpai_single_wait -v
+python -m pytest tests/test_tiles_away.py::test_waiting_single_wait -v
 
 # Run slow tests (full game simulations)
 python -m pytest -m slow -v
@@ -48,7 +106,7 @@ All 8 phases are complete. The stack is: heuristic engine (phases 1–5) → Mon
 
 ### Tile Encoding (`src/cracked/tiles.py`)
 
-Tiles are encoded as integers 0–33 in a **34-element numpy int8 array** where the value is the count of that tile type. This array representation is used throughout — not OOP tile objects — because shanten calculation runs thousands of times per recommendation.
+Tiles are encoded as integers 0–33 in a **34-element numpy int8 array** where the value is the count of that tile type. This array representation is used throughout — not OOP tile objects — because tiles-away calculation runs thousands of times per recommendation.
 
 ```
 0–8:   Bamboo 1–9
@@ -72,18 +130,18 @@ Bonus tile helpers: `bonus_tile_id(name)` parses names like `"f1"`, `"spring"`, 
 
 `Meld` stores `MeldType` (CHOW/PONG/KONG), the tile IDs, whether it's concealed, and the source player seat.
 
-### Shanten Calculator (`src/cracked/shanten.py`)
+### Tiles-away Calculator (`src/cracked/tiles_away.py`)
 
-Three winning forms are evaluated and the minimum shanten taken:
+Three winning forms are evaluated and the minimum tiles-away count taken:
 1. **Standard form**: recursive backtracking over suits + honor handling
 2. **Seven pairs**: `6 - count_of_pairs`
 3. **Thirteen orphans**: `13 - unique_orphans - has_pair`
 
 Key correctness invariant: **isolated honor tiles (count=1) contribute 0 to the partial-block count** in standard form. Honor tiles can only form triplets (no sequences), so a lone honor needs 2 more draws to be useful — it is not a 1-draw partial. Only honor pairs (count≥2) count as partials.
 
-`acceptance_count(hand13, unknown_tiles)` returns a dict of `{tile_id: count_remaining}` for tiles that reduce shanten if drawn. Returns `{}` immediately for complete hands (shanten=-1).
+`acceptance_count(hand13, unknown_tiles)` returns a dict of `{tile_id: count_remaining}` for tiles that reduce tiles away if drawn. Returns `{}` immediately for complete hands (tiles_away=-1).
 
-`best_discards(hand14, unknown_tiles)` evaluates every candidate discard from a 14-tile hand, returning results sorted by `(shanten_after ASC, weighted_acceptance DESC)`.
+`best_discards(hand14, unknown_tiles)` evaluates every candidate discard from a 14-tile hand, returning results sorted by `(tiles_away_after ASC, weighted_acceptance DESC)`.
 
 ### Scoring Engine (`src/cracked/scoring.py`)
 
@@ -161,12 +219,12 @@ CLI tests use Click's `CliRunner` with `monkeypatch` to isolate state files — 
 
 **Claim priority**: Ron (any discard completes hand) > Pong/Kong (clockwise) > Chow (left player only). Human players skip claim opportunities (no claim UI yet).
 
-**AI claim heuristics**: `_ai_wants_pong()` accepts if best post-pong discard maintains or improves shanten; `_ai_wants_kong()` allows up to shanten+1 (replacement compensates); `_pick_best_chow()` requires strict shanten improvement.
+**AI claim heuristics**: `_ai_wants_pong()` accepts if best post-pong discard maintains or improves tiles away; `_ai_wants_kong()` allows up to one extra tiles-away step (replacement compensates); `_pick_best_chow()` requires strict tiles-away improvement.
 
 ### Module Dependency Order
 
 ```
-tiles → hand → shanten → scoring → game_state → danger → opponent_model → optimizer → cli
+tiles → hand → tiles_away → scoring → game_state → danger → opponent_model → optimizer → cli
                                                                         ↘ simulator ↗
                                                           optimizer + simulator → engine → match → tui_game
                                                                         optimizer → tui
@@ -194,3 +252,12 @@ Chip payment scale: shooter pays 4/8/16/32/64 chips; zimo (self-draw) each oppon
 - Seven pairs is a valid winning form
 - Wall stops at **15 tiles remaining** (dead wall) — drawing stops there, not at 0
 - Kong during a hand sets `engine.kong_declared = True`; if wall then exhausts, seats rotate (unlike a normal draw)
+
+### Training Feature Vectors (`src/cracked/training/features.py`)
+
+Two vector layouts are derived from a `GameState` (constants are the source of truth — keep these in sync if the layout changes):
+
+- `extract_state_features(state)` → **`N_STATE_FEATURES = 230`** (89-dim state block + 3 × 47-dim opponent blocks). Used by the ActorCritic policy/value nets in `self_play.py`, which evaluate the whole state at once.
+- `extract_features(state, candidate_discard)` → **`N_FEATURES = 265`** (the 230 state features plus a 35-dim candidate-discard block: 34-dim tile one-hot + tiles-away-after). Used by the supervised `DangerNet`, which scores one candidate discard at a time.
+
+The 89-dim state block covers concealed/unknown tile counts, meld/flower/animal counts, tiles away, seat and prevailing wind one-hots, wall/turn progress, and optimizer-derived hand-structure signals (tai potential, flush purity, pair count, all-pong/seven-pairs flags, adaptive α). Each 47-dim opponent block covers seat one-hot, meld count, discard counts, waiting probability, suit/honor bias, and dragon/wind danger counts.

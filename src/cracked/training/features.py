@@ -7,7 +7,7 @@ import numpy as np
 from cracked.tiles import NTILES, Wind, WIND_START, WIND_END, DRAGON_START, DRAGON_END
 from cracked.game_state import GameState
 from cracked.opponent_model import model_all_opponents
-from cracked.shanten import shanten
+from cracked.tiles_away import tiles_away
 from cracked.optimizer import hand_tai_potential, adaptive_alpha
 
 _WIND_ORDER = [Wind.EAST, Wind.SOUTH, Wind.WEST, Wind.NORTH]
@@ -21,7 +21,7 @@ _WIND_ORDER = [Wind.EAST, Wind.SOUTH, Wind.WEST, Wind.NORTH]
 #   [68]      n_melds / 4
 #   [69]      n_flowers / 8
 #   [70]      n_animals / 4
-#   [71]      current shanten, (s+1)/9  (-1→0, 7→0.89)
+#   [71]      current tiles_away, (s+1)/9  (-1→0, 7→0.89)
 #   [72:76]   my seat wind one-hot
 #   [76:80]   prevailing wind one-hot
 #   [80]      turn / 40, clamped
@@ -38,7 +38,7 @@ _WIND_ORDER = [Wind.EAST, Wind.SOUTH, Wind.WEST, Wind.NORTH]
 #   [+0:4]    seat wind one-hot
 #   [+4]      n_melds / 4
 #   [+5:39]   discard tile counts / 4
-#   [+39]     tenpai_prob
+#   [+39]     waiting_prob
 #   [+40:44]  suit_bias one-hot [bamboo, chars, circles, none]
 #   [+44]     honor_bias
 #   [+45]     dragon_danger_count / 3
@@ -48,7 +48,7 @@ _WIND_ORDER = [Wind.EAST, Wind.SOUTH, Wind.WEST, Wind.NORTH]
 #
 # Candidate-discard block (35 dims) appended by extract_features:
 #   [+0:34]   candidate tile one-hot
-#   [+34]     shanten after discard, (s+1)/9
+#   [+34]     tiles_away after discard, (s+1)/9
 #
 # N_FEATURES = 230 + 35 = 265  (used by supervised DangerNet)
 
@@ -70,7 +70,7 @@ def _fill_state_block(feat: np.ndarray, state: GameState, models=None) -> None:
     feat[68] = n_melds / 4.0
     feat[69] = len(hand.flowers) / 8.0
     feat[70] = len(hand.animals) / 4.0
-    s = shanten(concealed, n_melds)
+    s = tiles_away(concealed, n_melds)
     feat[71] = (s + 1) / 9.0
     for i, w in enumerate(_WIND_ORDER):
         feat[72 + i] = 1.0 if state.my_seat == w else 0.0
@@ -123,7 +123,7 @@ def _fill_opponent_blocks(
         for t in opp.discards:
             discard_arr[t] += 1
         feat[b + 5: b + 39] = discard_arr / 4.0
-        feat[b + 39] = model.tenpai_prob
+        feat[b + 39] = model.waiting_prob
         suit_idx = model.suit_bias if model.suit_bias is not None else 3
         feat[b + 40 + suit_idx] = 1.0
         feat[b + 44] = 1.0 if model.honor_bias else 0.0
@@ -158,7 +158,7 @@ def extract_features(state: GameState, candidate_discard: int) -> np.ndarray:
     N_FEATURES (265).
 
     The first 89 dims are the state block (same as extract_state_features).
-    The next 35 dims encode the candidate tile and shanten-after.
+    The next 35 dims encode the candidate tile and tiles_away-after.
     The final 141 dims encode the three opponents.
     """
     feat = np.zeros(N_FEATURES, dtype=np.float32)
@@ -170,7 +170,7 @@ def extract_features(state: GameState, candidate_discard: int) -> np.ndarray:
     feat[cand_base + candidate_discard] = 1.0
     trial = state.my_hand.concealed.copy()
     trial[candidate_discard] -= 1
-    s_after = shanten(trial, len(state.my_hand.melds))
+    s_after = tiles_away(trial, len(state.my_hand.melds))
     feat[cand_base + 34] = (s_after + 1) / 9.0
 
     # Opponent blocks at [124:265]

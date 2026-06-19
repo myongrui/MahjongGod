@@ -144,3 +144,28 @@ def test_best_discards_honors_over_suited_when_isolated():
     top_tile_ids = {r["tile_id"] for r in results[:3]}
     # Either nw or rd should be among the top discards (isolated honors)
     assert tile_id("nw") in top_tile_ids or tile_id("rd") in top_tile_ids
+
+
+# ---------------------------------------------------------------------------
+# Two-step acceptance tie-breaking — Point 4
+# ---------------------------------------------------------------------------
+
+def test_two_step_acceptance_breaks_one_step_ties():
+    # sw and d5 are tied on tiles_away AND 1-step acceptance, but discarding d5
+    # leaves a hand with worse follow-ups. With two_step=True the better
+    # continuation (sw) must rank ahead — 1-step efficiency alone cannot see this.
+    h = hand("b1","b2","b8","b8","b9","c4","c5","c7","c9","d1","d5","sw","ww","gd")
+    wall = full_wall()
+    for tid in range(34):
+        wall[tid] = max(0, 4 - int(h[tid]))
+
+    res = best_discards(h.copy(), wall.copy(), two_step=True)
+    sw = next(r for r in res if r["tile_id"] == tile_id("sw"))
+    d5 = next(r for r in res if r["tile_id"] == tile_id("d5"))
+
+    # Tied on the 1-step metrics...
+    assert sw["tiles_away_after"] == d5["tiles_away_after"]
+    assert sw["weighted_acceptance"] == d5["weighted_acceptance"]
+    # ...but the 2-step continuation favours sw, so it ranks ahead.
+    assert sw["acceptance_2step"] > d5["acceptance_2step"]
+    assert res.index(sw) < res.index(d5)

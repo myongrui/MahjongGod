@@ -7,7 +7,7 @@ win and shoot probabilities for each candidate discard.
 V1 simplifications (to be refined in later phases):
   - No meld claiming during simulation (pong/chow from discards not modelled)
   - Simplified tai estimation for payment calculation
-  - All players use the same pure-shanten discard heuristic
+  - All players use the same pure-tiles_away discard heuristic
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import numpy as np
 
 from cracked.tiles import NTILES, is_suited, is_honor, suit_of, DRAGON_START, DRAGON_END
 from cracked.game_state import GameState
-from cracked.shanten import shanten
+from cracked.tiles_away import tiles_away
 
 _MIN_TAI = 1  # minimum tai required to declare a win
 
@@ -37,7 +37,7 @@ class SimHand:
     seat: int               # Wind constant (27–30)
 
     def is_winner(self) -> bool:
-        return shanten(self.concealed, self.n_melds) == -1
+        return tiles_away(self.concealed, self.n_melds) == -1
 
     def can_win_from(self, tid: int) -> bool:
         """Would drawing tid complete this hand?"""
@@ -91,24 +91,24 @@ def heuristic_discard(hand: SimHand) -> int:  # public alias
 
 def _heuristic_discard(hand: SimHand) -> int:
     """
-    Discard the tile that minimises shanten.
+    Discard the tile that minimises tiles_away.
     Break ties by preferring isolated honor tiles (hardest to improve).
     """
     best_tid = -1
-    best_shanten = 99
+    best_tiles_away = 99
     best_is_honor = False
 
     for tid in range(NTILES):
         if hand.concealed[tid] == 0:
             continue
         hand.concealed[tid] -= 1
-        s = shanten(hand.concealed, hand.n_melds)
+        s = tiles_away(hand.concealed, hand.n_melds)
         hand.concealed[tid] += 1
 
         isolated_honor = is_honor(tid) and hand.concealed[tid] == 1
-        if (s < best_shanten
-                or (s == best_shanten and isolated_honor and not best_is_honor)):
-            best_shanten = s
+        if (s < best_tiles_away
+                or (s == best_tiles_away and isolated_honor and not best_is_honor)):
+            best_tiles_away = s
             best_tid = tid
             best_is_honor = isolated_honor
 
@@ -227,7 +227,7 @@ def _play_one_game(
             discard = _heuristic_discard(h)
             h.concealed[discard] -= 1
 
-            # Ron (discard) win check — all other players
+            # Discard win check — all other players
             for claimer_seat in all_seats:
                 if claimer_seat == seat:
                     continue

@@ -63,11 +63,11 @@ def test_hand_invalid_tile_name_rejected(runner):
     assert r.exit_code != 0
 
 
-def test_hand_shows_shanten(runner):
+def test_hand_shows_tiles_away(runner):
     _new_game(runner)
     r = runner.invoke(cli, ["hand",
         "b1","b2","b3","c1","c2","c3","d1","d2","d3","ew","ew","ew","rd"])
-    assert "Shanten" in r.output
+    assert "Tiles away" in r.output
 
 
 # ---------------------------------------------------------------------------
@@ -196,18 +196,18 @@ def test_recommend_after_draw(runner):
     runner.invoke(cli, ["draw", "rd"])
     r = runner.invoke(cli, ["recommend"])
     assert r.exit_code == 0
-    assert "Discard" in r.output or "Tenpai" in r.output or "Complete" in r.output
+    assert "Discard" in r.output or "Waiting" in r.output or "Complete" in r.output
 
 
-def test_recommend_tenpai_hand(runner):
-    # Hand that is tenpai after draw: pure sequences waiting on pair
+def test_recommend_waiting_hand(runner):
+    # Hand that is waiting after draw: pure sequences waiting on pair
     _new_game(runner)
     runner.invoke(cli, ["hand",
         "b1","b2","b3","c1","c2","c3","d1","d2","d3","ew","ew","ew","rd"])
     runner.invoke(cli, ["draw", "rd"])
     r = runner.invoke(cli, ["recommend"])
     assert r.exit_code == 0
-    assert "Tenpai" in r.output or "shanten: -1" in r.output or "Discard" in r.output
+    assert "Waiting" in r.output or "tiles_away: -1" in r.output or "Discard" in r.output
 
 
 # ---------------------------------------------------------------------------

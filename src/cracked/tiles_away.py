@@ -255,7 +255,7 @@ def tiles_away(hand: np.ndarray, exposed_melds: int = 0) -> int:
 
 def acceptance_count(hand: np.ndarray, unknown_tiles: np.ndarray, exposed_melds: int = 0) -> dict[int, int]:
     """
-    Compute the acceptance set (uke-ire): tiles that would reduce tiles_away if drawn.
+    Compute the acceptance set: tiles that would reduce tiles_away if drawn.
 
     hand: 34-element concealed hand array (13 tiles — after a discard).
     unknown_tiles: 34-element array of tiles not yet visible (in wall or opponent hands).
@@ -277,13 +277,63 @@ def acceptance_count(hand: np.ndarray, unknown_tiles: np.ndarray, exposed_melds:
     return result
 
 
-def best_discards(hand14: np.ndarray, unknown_tiles: np.ndarray, exposed_melds: int = 0) -> list[dict]:
+def expected_acceptance_2step(
+    hand13: np.ndarray, unknown_tiles: np.ndarray, exposed_melds: int = 0
+) -> int:
+    """
+    Two-step acceptance: for a 13-tile hand, the count-weighted
+    acceptance available *after* the best follow-up discard.
+
+    Greedy 1-step acceptance just counts tiles that advance the hand now; it
+    misvalues shapes whose follow-ups differ. For each tile that advances
+    tiles_away, we draw it, find the best resulting discard's acceptance, and
+    weight by how many copies remain. Used as a tie-breaker between discards
+    with equal 1-step acceptance — a two-sided keeper beats a closed one.
+
+    hand13 and unknown_tiles are restored before returning.
+    """
+    current = tiles_away(hand13, exposed_melds)
+    if current == -1:
+        return 0
+    total = 0
+    for t in range(NTILES):
+        c = int(unknown_tiles[t])
+        if c <= 0:
+            continue
+        hand13[t] += 1
+        if tiles_away(hand13, exposed_melds) < current:
+            unknown_tiles[t] -= 1
+            best_follow = 0
+            for d in range(NTILES):
+                if hand13[d] == 0:
+                    continue
+                hand13[d] -= 1
+                follow = sum(acceptance_count(hand13, unknown_tiles, exposed_melds).values())
+                hand13[d] += 1
+                if follow > best_follow:
+                    best_follow = follow
+            unknown_tiles[t] += 1
+            total += c * best_follow
+        hand13[t] -= 1
+    return total
+
+
+def best_discards(
+    hand14: np.ndarray,
+    unknown_tiles: np.ndarray,
+    exposed_melds: int = 0,
+    two_step: bool = False,
+) -> list[dict]:
     """
     For a 14-tile hand, evaluate every possible discard and return results sorted
-    by (tiles_away_after ASC, acceptance_count DESC).
+    by (tiles_away_after ASC, weighted_acceptance DESC).
 
     Returns a list of dicts with keys:
       tile_id, tiles_away_after, acceptance, weighted_acceptance
+
+    two_step: also compute `acceptance_2step` per candidate and use it
+    as a tie-breaker after 1-step acceptance, so shapes with better follow-ups win
+    when the immediate acceptance is equal. Costs extra compute, so it is opt-in.
     """
     results = []
     for tid in range(NTILES):
@@ -293,13 +343,23 @@ def best_discards(hand14: np.ndarray, unknown_tiles: np.ndarray, exposed_melds: 
         s = tiles_away(hand14, exposed_melds)
         acc = acceptance_count(hand14, unknown_tiles, exposed_melds) if s >= 0 else {}
         weighted = sum(acc.values())
-        results.append({
+        entry = {
             "tile_id": tid,
             "tiles_away_after": s,
             "acceptance": acc,
             "weighted_acceptance": weighted,
-        })
+        }
+        if two_step:
+            entry["acceptance_2step"] = (
+                expected_acceptance_2step(hand14, unknown_tiles, exposed_melds) if s >= 0 else 0
+            )
         hand14[tid] += 1
+        results.append(entry)
 
-    results.sort(key=lambda x: (x["tiles_away_after"], -x["weighted_acceptance"]))
+    if two_step:
+        results.sort(key=lambda x: (
+            x["tiles_away_after"], -x["weighted_acceptance"], -x["acceptance_2step"]
+        ))
+    else:
+        results.sort(key=lambda x: (x["tiles_away_after"], -x["weighted_acceptance"]))
     return results

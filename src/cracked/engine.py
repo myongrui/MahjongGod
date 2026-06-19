@@ -6,7 +6,7 @@ wall, discard piles). Drives both spectator and interactive TUI modes.
 Claim mechanics:
   - Pong/Kong: any player (except discarder), clockwise priority.
   - Chow: left player only (discarder + 1 in turn order).
-  - Ron always takes priority over all claims.
+  - Discard win always takes priority over all claims.
   - Human players skip claim opportunities (no UI yet).
 
 Bonus tiles (flowers 34-37, seasons 38-41, animals 42-45) are included in the
@@ -24,7 +24,7 @@ import numpy as np
 from cracked.tiles import NTILES, Wind, tile_name, is_bonus_tile, is_animal
 from cracked.hand import HandState, Meld, MeldType
 from cracked.game_state import GameState, PlayerView
-from cracked.shanten import shanten
+from cracked.tiles_away import tiles_away
 from cracked.scoring import calculate_tai, WinContext, chip_payment, STARTING_CHIPS
 from cracked.simulator import SimHand, _heuristic_discard
 from cracked.optimizer import recommend_discard, DiscardRecommendation
@@ -178,7 +178,7 @@ class GameEngine:
 
         drawn = next(e.tile for e in reversed(draw_events) if e.type == EventType.DRAW)
 
-        if shanten(player.hand.concealed, len(player.hand.melds)) == -1:
+        if tiles_away(player.hand.concealed, len(player.hand.melds)) == -1:
             ctx = WinContext(winning_tile=drawn, is_self_draw=True,
                              is_last_tile=self.wall_remaining <= 15)
             tai_result = calculate_tai(player.hand, ctx)
@@ -274,7 +274,7 @@ class GameEngine:
     # ------------------------------------------------------------------
 
     def _execute_discard(self, seat: int, forced: Optional[int] = None) -> list[GameEvent]:
-        """Remove a tile from seat's hand, check for ron, then check for claims."""
+        """Remove a tile from seat's hand, check for a discard win, then check for claims."""
         player = self.players[seat]
         events: list[GameEvent] = []
 
@@ -288,14 +288,14 @@ class GameEngine:
         player.discards.append(tid)
         events.append(GameEvent(EventType.DISCARD, seat=seat, tile=tid))
 
-        # Ron check
+        # Discard-win check
         for claimer_seat in _WIND_ORDER:
             if claimer_seat == seat:
                 continue
             claimer = self.players[claimer_seat]
             claimer.hand.concealed[tid] += 1
             tai_result = None
-            if shanten(claimer.hand.concealed, len(claimer.hand.melds)) == -1:
+            if tiles_away(claimer.hand.concealed, len(claimer.hand.melds)) == -1:
                 ctx = WinContext(winning_tile=tid, is_self_draw=False,
                                  is_last_tile=self.wall_remaining <= 15)
                 tai_result = calculate_tai(claimer.hand, ctx)
@@ -350,16 +350,16 @@ class GameEngine:
     # ------------------------------------------------------------------
 
     def _ai_wants_pong(self, seat: int, tile: int) -> bool:
-        """True if ponging and then making the best discard maintains or improves shanten."""
+        """True if ponging and then making the best discard maintains or improves tiles_away."""
         player = self.players[seat]
-        current_s = shanten(player.hand.concealed, len(player.hand.melds))
+        current_s = tiles_away(player.hand.concealed, len(player.hand.melds))
         if current_s == -1:
             return False
         test = player.hand.concealed.copy()
         test[tile] -= 2
         test_melds = len(player.hand.melds) + 1
         best_s = min(
-            (shanten(test - np.eye(NTILES, dtype=np.int8)[t], test_melds)
+            (tiles_away(test - np.eye(NTILES, dtype=np.int8)[t], test_melds)
              for t in range(NTILES) if test[t] > 0),
             default=current_s,
         )
@@ -369,12 +369,12 @@ class GameEngine:
         """True if the hand structure is not significantly worsened by konging
         (replacement draw compensates for one extra step)."""
         player = self.players[seat]
-        current_s = shanten(player.hand.concealed, len(player.hand.melds))
+        current_s = tiles_away(player.hand.concealed, len(player.hand.melds))
         test = player.hand.concealed.copy()
         test[tile] -= 3
         test_melds = len(player.hand.melds) + 1
         best_s = min(
-            (shanten(test - np.eye(NTILES, dtype=np.int8)[t], test_melds)
+            (tiles_away(test - np.eye(NTILES, dtype=np.int8)[t], test_melds)
              for t in range(NTILES) if test[t] > 0),
             default=current_s,
         )
@@ -396,12 +396,12 @@ class GameEngine:
         return options
 
     def _pick_best_chow(self, seat: int, tile: int) -> Optional[tuple[int, int, int]]:
-        """Return the chow option that strictly improves shanten, or None."""
+        """Return the chow option that strictly improves tiles_away, or None."""
         player = self.players[seat]
         options = self._find_chow_options(player.hand, tile)
         if not options:
             return None
-        current_s = shanten(player.hand.concealed, len(player.hand.melds))
+        current_s = tiles_away(player.hand.concealed, len(player.hand.melds))
         best_option: Optional[tuple[int, int, int]] = None
         best_s = current_s  # chow requires strict improvement
         eye = np.eye(NTILES, dtype=np.int8)
@@ -412,7 +412,7 @@ class GameEngine:
                     test[t] -= 1
             test_melds = len(player.hand.melds) + 1
             min_s = min(
-                (shanten(test - eye[t], test_melds) for t in range(NTILES) if test[t] > 0),
+                (tiles_away(test - eye[t], test_melds) for t in range(NTILES) if test[t] > 0),
                 default=current_s,
             )
             if min_s < best_s:
@@ -457,7 +457,7 @@ class GameEngine:
             self._phase = "finished"
             return events
 
-        if shanten(claimer.hand.concealed, len(claimer.hand.melds)) == -1:
+        if tiles_away(claimer.hand.concealed, len(claimer.hand.melds)) == -1:
             drawn = next(e.tile for e in reversed(draw_events) if e.type == EventType.DRAW)
             ctx = WinContext(winning_tile=drawn, is_self_draw=True, is_replacement=True,
                              is_last_tile=self.wall_remaining <= 15)

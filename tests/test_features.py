@@ -151,24 +151,24 @@ def test_concealed_quad_normalized():
 
 
 # ---------------------------------------------------------------------------
-# Shanten after discard (index _STATE_BLOCK_SIZE + 34)
+# Tiles-away after discard (index _STATE_BLOCK_SIZE + 34)
 # ---------------------------------------------------------------------------
 
-_SHANTEN_IDX = _STATE_BLOCK_SIZE + 34
+_TILES_AWAY_IDX = _STATE_BLOCK_SIZE + 34
 
-def test_shanten_after_tenpai_discard():
-    # Discarding gd from this hand leaves shanten=0 → (0+1)/9
+def test_tiles_away_after_waiting_discard():
+    # Discarding gd from this hand leaves tiles_away=0 → (0+1)/9
     state = _make_state()
     _set_hand(state, *_FULL_HAND)
     feat = extract_features(state, tile_id("gd"))
-    assert feat[_SHANTEN_IDX] == pytest.approx(1.0 / 9.0, abs=1e-5)
+    assert feat[_TILES_AWAY_IDX] == pytest.approx(1.0 / 9.0, abs=1e-5)
 
 
-def test_shanten_after_is_nonnegative():
+def test_tiles_away_after_is_nonnegative():
     state = _make_state()
     _set_hand(state, *_FULL_HAND)
     feat = extract_features(state, tile_id("rd"))
-    assert feat[_SHANTEN_IDX] >= 0.0
+    assert feat[_TILES_AWAY_IDX] >= 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +188,7 @@ def test_opponent_discard_reflected_in_features():
     assert feat[_OPP_BASE + 5 + b5_id] == pytest.approx(2.0 / 4.0)
 
 
-def test_opponent_tenpai_prob_encoded():
+def test_opponent_waiting_prob_encoded():
     state = _make_state()
     _set_hand(state, *_FULL_HAND)
     state.turn_number = 0
@@ -199,7 +199,7 @@ def test_opponent_tenpai_prob_encoded():
     state2.turn_number = 30
     feat_high = extract_features(state2, tile_id("gd"))
 
-    # tenpai_prob at base+39; higher turn → higher prob
+    # waiting_prob at base+39; higher turn → higher prob
     assert feat_high[_OPP_BASE + 39] >= feat_low[_OPP_BASE + 39]
 
 

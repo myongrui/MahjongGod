@@ -113,6 +113,35 @@ def test_deal_fresh_game_different_seeds():
 
 
 # ---------------------------------------------------------------------------
+# Oracle guiding — Suphx-style privileged signal (no torch needed)
+# ---------------------------------------------------------------------------
+
+def test_oracle_threat_higher_when_opponent_closer():
+    from cracked.training.self_play import oracle_threat
+    from cracked.simulator import SimHand
+    near = SimHand(
+        tiles_from_names(["b1","b2","b3","c1","c2","c3","d1","d2","d3","ew","ew","ew","rd"]),
+        0, int(Wind.SOUTH),
+    )  # 4 sets + lone rd → waiting
+    far = SimHand(
+        tiles_from_names(["b1","b3","b5","b7","b9","c2","c4","c6","c8","d1","d3","d5","ew"]),
+        0, int(Wind.WEST),
+    )  # scattered, far from a win
+    assert oracle_threat([near]) > oracle_threat([far])
+
+
+def test_oracle_threat_empty_is_zero():
+    from cracked.training.self_play import oracle_threat
+    assert oracle_threat([]) == 0.0
+
+
+def test_oracle_warmstart_variant_present():
+    from cracked.training.experiment import VARIANTS
+    assert "oracle_warmstart" in VARIANTS
+    assert VARIANTS["oracle_warmstart"]["oracle_coef"] > 0.0
+
+
+# ---------------------------------------------------------------------------
 # ActorCritic (requires torch)
 # ---------------------------------------------------------------------------
 
