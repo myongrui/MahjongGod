@@ -128,7 +128,38 @@ cracked-ui
 
 # Game viewer — choose spectator or interactive mode
 cracked-play
+
+# Spatial table-view prototype (static preview, no engine yet)
+python -m cracked.tui_table          # hybrid: glyph hands + custom-face melds
+python -m cracked.tui_table_faces    # variant: every tile uses the custom faces
+
+# Animation demo — tiles thrown into the centre (engine-free preview)
+python -m cracked.tui_anim_demo
+
+# Physics demo — rotating tiles collide & bounce (engine-free tech demo)
+python -m cracked.tui_physics_demo
 ```
+
+### Graphical (pygame-ce) prototype
+
+A real 2D-graphics front-end (vs the terminal TUIs). Requires `pip install -e ".[game]"`.
+
+```bash
+python -m cracked.pygame_table        # desktop window — 2.5D table
+python -m cracked.pygame_physics       # bouncing/rotating/colliding tiles (space = re-scatter)
+```
+
+The table is dealt by the real engine; tiles are the custom `tui_tiles` faces
+rendered as crisp nearest-scaled sprites; a discard animates into the centre.
+The loop is written async, so the same code can be packaged for the browser with
+[`pygbag`](https://pypi.org/project/pygbag/) (`pygbag src/cracked/pygame_table.py`).
+
+> **`python -m cracked.tui_table`** is an early, static prototype of a redesigned
+> "real mahjong table" look — you at the bottom, opponents on the other sides, a
+> shared discard pool and the wall in the centre, melds in front of each player,
+> colored tiles, table wind and per-seat chips on the felt. It is driven by
+> hard-coded sample data (no game logic) to preview the layout before it is wired
+> to the live engine and animated.
 
 ### Advisor mode (`cracked-ui`)
 
@@ -138,7 +169,7 @@ Enter any 13-tile hand and a draw tile. Press **R** to get ranked discard recomm
 
 On launch, choose a mode:
 
-**Spectator** — watch four heuristic AI bots play a full game. Claim mechanics (pong, kong, chow) are live: bots evaluate each discard and claim when it improves their hand. Bonus tiles (flowers, seasons, animals) are drawn and replaced automatically. Adjust speed or pause at any time.
+**Spectator** — watch four AI bots play a full game. Each bot is driven by a seat `Policy` (`src/cracked/policy.py`); the default `HeuristicPolicy` plays the full risk-aware heuristic (danger scoring + opponent modeling via `recommend_discard`), not just tiles-away minimization. Claim mechanics (pong, kong, chow) are live: bots evaluate each discard and claim when it improves their hand. Bonus tiles (flowers, seasons, animals) are drawn and replaced automatically. Adjust speed or pause at any time.
 
 **Interactive** — you play as East against three AI opponents. The engine pauses on your turn, shows ranked discard recommendations, and accepts tile names (`b1`, `ew`, `rd`, etc.) as input. Opponents claim your discards using the same heuristic.
 
@@ -174,17 +205,19 @@ python -m cracked.training.trainer \
 python -m cracked.training.self_play \
     --episodes 20000 \
     --out models/policy.pt \
+    --n-rounds 4 \
     --eval-every 500 \
-    --eval-games 200 \
+    --eval-games 20 \
     --resume        # continue from existing checkpoint
 ```
 
-The policy trains from all four seat positions (East/South/West/North) against three heuristic opponents. The agent auto-claims pongs, kongs, and chows using the same heuristics as its opponents (equal footing), then runs the RL policy to decide what to discard after each claim. Wall stops at 15 tiles remaining, matching real game rules. Checkpoints are saved whenever evaluation improves.
+The policy trains **inside the real game engine** over full multi-hand matches (`GameMatch`): the agent occupies one rotating seat against three fixed-weight `HeuristicPolicy` opponents, real `calculate_tai` scoring drives chip payments, and the episode reward is the agent's **net chip change over the whole match**. The agent auto-claims pongs, kongs, and chows using the heuristic placeholder (claim learning is a future step), then runs the RL policy to decide what to discard after each claim. Wall stops at 15 tiles remaining, matching real game rules. Checkpoints are saved whenever evaluation improves.
 
 **Reward tuning flags:**
 
 | Flag | Default | Description |
 |---|---|---|
+| `--n-rounds` | `4` | Table-wind rounds per match (`4` = East+South+West+North, a full game) |
 | `--gamma` | `1.0` | Discount factor for returns (`0.99` = standard discounting) |
 | `--tiles-away-reward` | `0.0` | Per-step reward for each tiles-away improvement |
 | `--waiting-bonus` | `0.0` | One-time reward the first time the agent reaches waiting in a game |
@@ -225,11 +258,7 @@ Built-in variants:
 | `full_fix` | Discount + tiles-away reward + strong shaping |
 | `waiting` | One-time waiting bonus (no normalisation) |
 | `normalized` | Reward normalisation to `[-1, +1]` only |
-| `normed_tenpai` | Normalised + tenpai bonus + `full_fix` params |
-| `recommended` | Scaled PBRS + acceptance potential + strong defense (the recommended starting point) |
-| `ablation_scale_only` | Just the PBRS scale fix, no other changes |
-| `ablation_no_shaping` | Pure terminal reward + defense, PBRS disabled |
-| `ablation_unscaled` | `recommended` params but without reward normalisation |
+| `normed_waiting` | Normalised + waiting bonus + `full_fix` params |
 
 Each variant saves its model to `models/{variant_name}.pt`. Add new variants by editing the `VARIANTS` dict at the top of `src/cracked/training/experiment.py`.
 

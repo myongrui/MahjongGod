@@ -1,9 +1,11 @@
 """
 Self-play RL training for Singapore Mahjong.
 
-Trains an ActorCritic policy network using REINFORCE with baseline
-(a simplified, single-clip PPO step).  The learning agent plays as East
-against three heuristic opponents from simulator.py.
+Trains an ActorCritic policy network with PPO. Each episode is a full match
+played inside the real game engine: the learning agent occupies one rotating
+seat and the other three are the fixed-weight HeuristicPolicy. The reward is
+the agent's true net chip change over the match (real scoring), so the policy
+optimizes chip count across a whole game.
 
 Usage:
     python -m cracked.training.self_play --episodes 5000 --out models/policy.pt
@@ -13,7 +15,6 @@ Requires PyTorch: pip install 'cracked[ml]'
 
 from __future__ import annotations
 
-import copy
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,17 +23,13 @@ from typing import Optional
 import numpy as np
 
 from cracked.tiles import NTILES, Wind
-from cracked.hand import HandState
-from cracked.game_state import GameState, PlayerView
-from cracked.simulator import (
-    SimHand, _heuristic_discard, _estimate_tai, _MIN_TAI,
-    _wants_pong_sim, _wants_kong_sim, _pick_best_chow_sim,
-)
-from cracked.scoring import chip_payment
+from cracked.game_state import GameState
+from cracked.scoring import STARTING_CHIPS
 from cracked.optimizer import hand_tai_potential
 from cracked.tiles_away import tiles_away, acceptance_count
 from cracked.danger import expected_shooting_cost
 from cracked.opponent_model import model_all_opponents
+from cracked.policy import HeuristicPolicy
 from cracked.training.features import N_STATE_FEATURES, extract_state_features
 
 _WIND_ORDER = [Wind.EAST, Wind.SOUTH, Wind.WEST, Wind.NORTH]
@@ -71,26 +68,6 @@ def _compute_potential(
         acc_val = min(sum(acc.values()) / 30.0, 1.0)
 
     return 1.2 * tiles_away_val + 0.8 * tai_val + 0.5 * acc_val
-
-
-def oracle_threat(opp_sims: list) -> float:
-    """
-    Privileged perfect-information threat in [0, 1]: how close the closest
-    opponent is to a complete hand, read from their actual concealed tiles.
-
-    Used for Suphx-style oracle guiding: early in training the agent gets a
-    perfect-information caution signal (opponents are dangerous *right now*),
-    which is annealed to zero so the final policy relies only on observable
-    state. A waiting opponent (tiles_away 0) returns 1.0; further away decays.
-    """
-    best = 99
-    for h in opp_sims:
-        s = tiles_away(h.concealed, h.n_melds)
-        if s < best:
-            best = s
-    if best >= 99:
-        return 0.0
-    return 1.0 / (1.0 + max(best, 0))
 
 
 def _require_torch():
@@ -204,350 +181,191 @@ class Step:
     potential: float = 0.0          # state potential φ(s) for PBRS reward shaping
     discard_reward: float = 0.0     # immediate defense penalty: −DEFENSE_WEIGHT × expected_cost
     progress_reward: float = 0.0    # tiles_away-progress reward: +tiles_away_reward per tiles_away step gained
+    is_hand_end: bool = False       # last agent step of a hand — PBRS does not telescope across the hand boundary
 
 
 @dataclass
 class Episode:
-    """Trajectory collected from one simulated game."""
+    """Trajectory collected from one game/match."""
     steps: list[Step] = field(default_factory=list)
-    terminal_reward: float = 0.0    # my_net from game result
+    terminal_reward: float = 0.0    # net chip change over the match
     final_potential: float = 0.0    # φ(s_T) at terminal state
 
 
 # ---------------------------------------------------------------------------
-# Game helpers
+# In-engine collection: the agent plays a full match inside the real engine
 # ---------------------------------------------------------------------------
 
-def _deal_fresh_game(rng: random.Random):
+def _torch_policy_fn(actor_critic):
+    """Adapt a torch ActorCritic into a feat→(logits, value) numpy callable."""
+    torch = _require_torch()
+
+    def fn(feat: np.ndarray):
+        with torch.no_grad():
+            logits, value = actor_critic(
+                torch.tensor(feat, dtype=torch.float32).unsqueeze(0)
+            )
+        return logits.squeeze(0).numpy(), float(value.squeeze(0))
+
+    return fn
+
+
+class RecordingPolicy:
+    """Learning agent's seat policy.
+
+    Samples discards from an injected ``policy_fn`` (feat → logits, value) and
+    records each decision for PPO. The fn is plain NumPy in/out so collection is
+    independent of torch (the torch network is wrapped by ``_torch_policy_fn``).
+    Claims use a fixed heuristic in this phase (claim-learning is a later step).
     """
-    Deal a complete 4-player starting position with all 148 tiles (136 standard + 12 bonus).
 
-    Returns (my_concealed, opp_concealeds, wall) where:
-      my_concealed   — int8 array (34,) for the learning agent
-      opp_concealeds — list of 3 int8 arrays, one per opponent
-      wall           — remaining tiles (including bonus tiles IDs 34-45)
-    Bonus tiles encountered during dealing are set aside without replacement,
-    mirroring the engine behaviour. Bonus tiles in the wall are handled during play.
-    """
-    pool = [tid for tid in range(NTILES) for _ in range(4)] + list(range(34, 46))
-    rng.shuffle(pool)
-    hands = []
-    idx = 0
-    for _ in range(4):
-        arr = np.zeros(NTILES, dtype=np.int8)
-        dealt = 0
-        while dealt < 13 and idx < len(pool):
-            tid = pool[idx]
-            idx += 1
-            if tid >= 34:  # bonus tile during deal — set aside, continue dealing
-                continue
-            arr[tid] += 1
-            dealt += 1
-        hands.append(arr)
-    return hands[0], hands[1:], pool[idx:]
+    def __init__(
+        self,
+        policy_fn,
+        rng: random.Random,
+        *,
+        defense_weight: float = DEFENSE_WEIGHT,
+        tiles_away_reward: float = 0.0,
+        waiting_bonus: float = 0.0,
+        reward_scale: float = 1.0,
+        greedy: bool = False,
+        claim_policy=None,
+    ):
+        self.policy_fn = policy_fn
+        self.rng = rng
+        self.defense_weight = defense_weight
+        self.tiles_away_reward = tiles_away_reward
+        self.waiting_bonus = waiting_bonus
+        self.reward_scale = reward_scale
+        self.greedy = greedy
+        self.claim_policy = claim_policy or HeuristicPolicy()
+        self.steps: list[Step] = []
+        self._prev_s: Optional[int] = None
+        self._waiting_reached = False
+
+    def reset_hand(self) -> None:
+        """Reset per-hand shaping state at the start of each new hand."""
+        self._prev_s = None
+        self._waiting_reached = False
+
+    def choose_discard(self, view: GameState) -> int:
+        concealed = view.my_hand.concealed
+        n_melds = len(view.my_hand.melds)
+
+        feat = extract_state_features(view)
+        logits, value = self.policy_fn(feat)
+        logits = np.asarray(logits, dtype=np.float64)
+
+        masked = np.where(concealed > 0, logits, -np.inf)
+        masked -= masked.max()
+        probs = np.exp(masked)
+        probs /= probs.sum()
+        if self.greedy:
+            action = int(np.argmax(probs))
+        else:
+            action = int(self.rng.choices(range(NTILES), weights=probs.tolist())[0])
+        log_prob = float(np.log(probs[action] + 1e-12))
+
+        # Per-step shaping signals (mirror the previous per-hand formulation).
+        post = concealed.copy()
+        post[action] -= 1
+        s_after = tiles_away(post, n_melds)
+        base_prev = self._prev_s if self._prev_s is not None else s_after
+        progress = self.tiles_away_reward * float(max(0, base_prev - s_after))
+        if not self._waiting_reached and s_after == 0:
+            self._waiting_reached = True
+            progress += self.waiting_bonus
+        progress *= self.reward_scale
+        self._prev_s = s_after
+
+        potential = _compute_potential(
+            post, n_melds, view.my_seat, view.prevailing_wind, view.unknown_tiles()
+        ) * self.reward_scale
+        models = model_all_opponents(view)
+        cost = expected_shooting_cost(action, view, models)
+        discard_reward = -self.defense_weight * cost * self.reward_scale
+
+        self.steps.append(Step(
+            state_feat=feat,
+            action=action,
+            old_log_prob=log_prob,
+            value_pred=float(value),
+            potential=potential,
+            discard_reward=discard_reward,
+            progress_reward=progress,
+        ))
+        return action
+
+    def wants_pong(self, view: GameState, tile: int) -> bool:
+        return self.claim_policy.wants_pong(view, tile)
+
+    def wants_kong(self, view: GameState, tile: int) -> bool:
+        return self.claim_policy.wants_kong(view, tile)
+
+    def choose_chow(self, view: GameState, tile: int, options):
+        return self.claim_policy.choose_chow(view, tile, options)
 
 
-def _build_game_state(
-    my_concealed: np.ndarray,
-    my_seat: int,
-    prevailing_wind: int,
-    wall_remaining: int,
-    turn: int,
-    opp_discards: list[list[int]],
-    opp_seats: list[int],
-) -> GameState:
-    """Construct a GameState snapshot for feature extraction."""
-    opponents = [
-        PlayerView(seat=seat, discards=list(opp_discards[i]))
-        for i, seat in enumerate(opp_seats)
-    ]
-    return GameState(
-        my_hand=HandState(
-            concealed=my_concealed.copy(),
-            seat_wind=my_seat,
-        ),
-        my_seat=my_seat,
-        prevailing_wind=prevailing_wind,
-        opponents=opponents,
-        wall_tiles_remaining=wall_remaining,
-        turn_number=turn,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Episode collection
-# ---------------------------------------------------------------------------
-
-def collect_episode(
-    actor_critic,
+def collect_match_episode(
+    policy_fn,
     rng: random.Random,
-    my_seat: int = Wind.EAST,
-    prevailing_wind: int = Wind.EAST,
-    shaping_scale: float = SHAPING_SCALE,
+    *,
+    n_rounds: int = 4,
+    agent_wind: int = Wind.EAST,
     defense_weight: float = DEFENSE_WEIGHT,
     tiles_away_reward: float = 0.0,
     waiting_bonus: float = 0.0,
     reward_scale: float = 1.0,
-    oracle_coef: float = 0.0,
 ) -> Episode:
+    """Play one full match inside the real engine and return the agent's Episode.
+
+    The agent occupies one seat (``RecordingPolicy``); the other three are the
+    fixed-weight ``HeuristicPolicy``. Real scoring and chip rotation come from
+    GameMatch, so the terminal reward is the agent's true net chip change over
+    the whole match. PBRS shaping is kept within each hand (steps carry an
+    is_hand_end marker so it does not telescope across hand boundaries).
     """
-    Play one game: learning agent (actor_critic) vs three heuristic AI opponents.
+    from cracked.match import GameMatch
 
-    Claims (pong/kong/chow) are decided by the same heuristics as AI opponents
-    so the agent competes on equal footing.  After each claim the agent runs its
-    RL policy to choose what to discard — giving more gradient signal per game.
-    Wall stops at 15 tiles remaining, matching the real game dead-wall rule.
-    """
-    torch = _require_torch()
-    import torch.nn.functional as F
+    agent = RecordingPolicy(
+        policy_fn, rng,
+        defense_weight=defense_weight,
+        tiles_away_reward=tiles_away_reward,
+        waiting_bonus=waiting_bonus,
+        reward_scale=reward_scale,
+    )
+    match = GameMatch(
+        n_rounds=n_rounds,
+        human_initial_wind=int(agent_wind),
+        agent_policy=agent,
+        seed=rng.randint(0, 2**31 - 1),
+    )
 
-    torch.manual_seed(rng.randint(0, 2**31 - 1))
-    my_concealed, opp_concealeds, wall = _deal_fresh_game(rng)
+    hand_guard = 0
+    max_hands = 4 * n_rounds * 8  # generous cap (rotations + extra East hands)
+    while not match.is_complete and hand_guard < max_hands:
+        match.start_hand()
+        agent.reset_hand()
+        n_before = len(agent.steps)
+        engine = match.engine
+        step_guard = 0
+        while not engine.is_finished and step_guard < 4000:
+            engine.step()
+            step_guard += 1
+        match.finish_hand()
+        if len(agent.steps) > n_before:
+            agent.steps[-1].is_hand_end = True  # close PBRS telescoping for this hand
+        hand_guard += 1
 
-    _WINDS = [int(Wind.EAST), int(Wind.SOUTH), int(Wind.WEST), int(Wind.NORTH)]
-    opp_seats = [s for s in _WINDS if s != my_seat]
-
-    my_sim = SimHand(my_concealed.copy(), 0, my_seat)
-    opp_sims = [SimHand(arr.copy(), 0, seat) for arr, seat in zip(opp_concealeds, opp_seats)]
-    all_seats = sorted([my_seat] + opp_seats)
-    sim_by_seat: dict[int, SimHand] = {my_seat: my_sim}
-    for h in opp_sims:
-        sim_by_seat[h.seat] = h
-
-    my_hand = my_concealed.copy()
-    opp_discards: list[list[int]] = [[], [], []]
-    opp_seat_to_idx = {seat: i for i, seat in enumerate(opp_seats)}
-    prev_tiles_away_val = tiles_away(my_hand, 0)
-    waiting_reached = False
-
-    episode = Episode()
-    wall_idx = 0
-    wall_remaining = len(wall)
-    turn = 0
-    n = len(all_seats)
-
-    def _finalize() -> Episode:
-        state_snap = _build_game_state(
-            my_hand, my_seat, prevailing_wind, wall_remaining, turn, opp_discards, opp_seats,
-        )
-        episode.final_potential = _compute_potential(
-            my_hand, my_sim.n_melds, my_seat, prevailing_wind, state_snap.unknown_tiles(),
-        ) * reward_scale
-        return episode
-
-    def _check_ron(discarder: int, tile: int) -> bool:
-        for claimer_seat in all_seats:
-            if claimer_seat == discarder:
-                continue
-            if sim_by_seat[claimer_seat].can_win_from(tile):
-                tai = _estimate_tai(sim_by_seat[claimer_seat].concealed, sim_by_seat[claimer_seat].n_melds)
-                if tai < _MIN_TAI:
-                    continue
-                shooter_pay, _ = chip_payment(tai)
-                if discarder == my_seat:
-                    episode.terminal_reward = -shooter_pay * reward_scale
-                elif claimer_seat == my_seat:
-                    episode.terminal_reward = shooter_pay * reward_scale
-                return True
-        return False
-
-    def _run_agent_discard() -> int:
-        """Run RL policy to pick a discard. Mutates my_hand, my_sim, episode. Returns tile id."""
-        nonlocal prev_tiles_away_val, waiting_reached
-
-        state_snap = _build_game_state(
-            my_hand, my_seat, prevailing_wind, wall_remaining, turn, opp_discards, opp_seats,
-        )
-        state_feat = extract_state_features(state_snap)
-        feat_t = torch.tensor(state_feat, dtype=torch.float32).unsqueeze(0)
-
-        with torch.no_grad():
-            logits, value_t = actor_critic(feat_t)
-        logits = logits.squeeze(0)
-        value = value_t.squeeze(0).item()
-
-        valid = torch.zeros(NTILES, dtype=torch.bool)
-        for t in range(NTILES):
-            if my_hand[t] > 0:
-                valid[t] = True
-        logits[~valid] = -1e9
-
-        log_probs = F.log_softmax(logits, dim=-1)
-        probs = log_probs.exp()
-        action = torch.multinomial(probs, 1).item()
-        old_log_prob = log_probs[action].item()
-
-        discard_tile = action
-        my_hand[discard_tile] -= 1
-        my_sim.concealed[discard_tile] -= 1
-
-        s_after = tiles_away(my_hand, my_sim.n_melds)
-        pr = tiles_away_reward * float(max(0, prev_tiles_away_val - s_after))
-        if not waiting_reached and s_after == 0:
-            waiting_reached = True
-            pr += waiting_bonus
-        pr *= reward_scale
-        prev_tiles_away_val = s_after
-
-        pot = _compute_potential(
-            my_hand, my_sim.n_melds, my_seat, prevailing_wind, state_snap.unknown_tiles(),
-        ) * reward_scale
-        opp_models = model_all_opponents(state_snap)
-        cost = expected_shooting_cost(discard_tile, state_snap, opp_models)
-        dr = -defense_weight * cost * reward_scale
-        # Oracle guiding: privileged perfect-information caution signal,
-        # annealed to zero over training by the caller (oracle_coef → 0).
-        if oracle_coef > 0.0:
-            dr += -oracle_coef * oracle_threat(opp_sims) * reward_scale
-        episode.steps.append(Step(state_feat, action, old_log_prob, value, pot, dr, pr))
-
-        return discard_tile
-
-    # East always draws first; all_seats is sorted so index 0 = East
-    seat_cursor = 0
-
-    for _ in range(MAX_ROUNDS * n * 2):  # generous upper cap
-        if wall_remaining <= 15:
-            return _finalize()
-
-        seat = all_seats[seat_cursor % n]
-
-        # Draw a non-bonus tile; bonus tiles (IDs 34-45) are set aside with auto-replacement
-        drawn = None
-        while wall_idx < len(wall):
-            if wall_remaining <= 15:
-                return _finalize()
-            tid = wall[wall_idx]
-            wall_idx += 1
-            wall_remaining -= 1
-            if tid < 34:
-                drawn = tid
-                break
-        if drawn is None:
-            return _finalize()
-
-        turn += 1
-        sim_by_seat[seat].concealed[drawn] += 1
-        if seat == my_seat:
-            my_hand[drawn] += 1
-
-        h = sim_by_seat[seat]
-
-        # Self-draw win check
-        if h.is_winner():
-            tai = _estimate_tai(h.concealed, h.n_melds)
-            if tai >= _MIN_TAI:
-                _, zimo_pay = chip_payment(tai)
-                net = zimo_pay * 3.0 if seat == my_seat else -zimo_pay
-                episode.terminal_reward = net * reward_scale
-                return _finalize()
-
-        # Discard: agent uses RL policy, AI uses heuristic
-        if seat == my_seat:
-            discard = _run_agent_discard()
-        else:
-            discard = _heuristic_discard(h)
-            h.concealed[discard] -= 1
-            opp_discards[opp_seat_to_idx[seat]].append(discard)
-
-        # Ron check (priority over all claims)
-        if _check_ron(seat, discard):
-            return _finalize()
-
-        # Claims: kong/pong (clockwise priority) then chow (left player only).
-        # Agent uses same heuristics as opponents; RL policy runs for post-claim discard.
-        seat_in_order = all_seats.index(seat)
-        claimed = False
-
-        for offset in range(1, n):
-            cs = all_seats[(seat_in_order + offset) % n]
-            ch = sim_by_seat[cs]
-
-            if ch.concealed[discard] >= 3 and _wants_kong_sim(ch, discard):
-                ch.concealed[discard] -= 3
-                ch.n_melds += 1
-                if cs == my_seat:
-                    my_hand[discard] -= 3
-                rep = None
-                while wall_idx < len(wall):
-                    if wall_remaining <= 15:
-                        return _finalize()
-                    rtid = wall[wall_idx]
-                    wall_idx += 1
-                    wall_remaining -= 1
-                    if rtid < 34:
-                        rep = rtid
-                        break
-                if rep is None:
-                    return _finalize()
-                ch.concealed[rep] += 1
-                if cs == my_seat:
-                    my_hand[rep] += 1
-                if ch.is_winner():
-                    tai = _estimate_tai(ch.concealed, ch.n_melds)
-                    if tai >= _MIN_TAI:
-                        _, zimo_pay = chip_payment(tai)
-                        net = zimo_pay * 3.0 if cs == my_seat else -zimo_pay
-                        episode.terminal_reward = net * reward_scale
-                        return _finalize()
-                if cs == my_seat:
-                    kong_disc = _run_agent_discard()
-                else:
-                    kong_disc = _heuristic_discard(ch)
-                    ch.concealed[kong_disc] -= 1
-                    opp_discards[opp_seat_to_idx[cs]].append(kong_disc)
-                if _check_ron(cs, kong_disc):
-                    return _finalize()
-                seat_cursor = all_seats.index(cs) + 1
-                claimed = True
-                break
-
-            elif ch.concealed[discard] >= 2 and _wants_pong_sim(ch, discard):
-                ch.concealed[discard] -= 2
-                ch.n_melds += 1
-                if cs == my_seat:
-                    my_hand[discard] -= 2
-                    pong_disc = _run_agent_discard()
-                else:
-                    pong_disc = _heuristic_discard(ch)
-                    ch.concealed[pong_disc] -= 1
-                    opp_discards[opp_seat_to_idx[cs]].append(pong_disc)
-                if _check_ron(cs, pong_disc):
-                    return _finalize()
-                seat_cursor = all_seats.index(cs) + 1
-                claimed = True
-                break
-
-        if not claimed:
-            left_cs = all_seats[(seat_in_order + 1) % n]
-            ch = sim_by_seat[left_cs]
-            chow = _pick_best_chow_sim(ch, discard)
-            if chow is not None:
-                for t in chow:
-                    if t != discard:
-                        ch.concealed[t] -= 1
-                        if left_cs == my_seat:
-                            my_hand[t] -= 1
-                ch.n_melds += 1
-                if left_cs == my_seat:
-                    chow_disc = _run_agent_discard()
-                else:
-                    chow_disc = _heuristic_discard(ch)
-                    ch.concealed[chow_disc] -= 1
-                    opp_discards[opp_seat_to_idx[left_cs]].append(chow_disc)
-                if _check_ron(left_cs, chow_disc):
-                    return _finalize()
-                seat_cursor = all_seats.index(left_cs) + 1
-                claimed = True
-
-        if not claimed:
-            seat_cursor += 1
-
-    return _finalize()
+    ep = Episode()
+    ep.steps = agent.steps
+    ep.terminal_reward = (match.agent_chips - STARTING_CHIPS) * reward_scale
+    ep.final_potential = 0.0  # match is over; last step is a hand boundary
+    return ep
 
 
-# ---------------------------------------------------------------------------
-# PPO update
+
+
 # ---------------------------------------------------------------------------
 
 def ppo_update(
@@ -588,8 +406,13 @@ def ppo_update(
         G = ep.terminal_reward
         for i in range(n - 1, -1, -1):
             step = ep.steps[i]
-            next_pot = ep.final_potential if i == n - 1 else ep.steps[i + 1].potential
-            pbrs = shaping_scale * (gamma * next_pot - step.potential)
+            if step.is_hand_end:
+                # PBRS stays within a hand; the hand-structure potential is
+                # meaningless across the reset to a fresh hand.
+                pbrs = 0.0
+            else:
+                next_pot = ep.final_potential if i == n - 1 else ep.steps[i + 1].potential
+                pbrs = shaping_scale * (gamma * next_pot - step.potential)
             G = step.discard_reward + step.progress_reward + pbrs + gamma * G
             returns[i] = G
         for i, step in enumerate(ep.steps):
@@ -646,40 +469,90 @@ def ppo_update(
 # Tournament evaluation
 # ---------------------------------------------------------------------------
 
+def play_eval_match(policy_fn, rng: random.Random, *, n_rounds: int, agent_wind: int) -> dict:
+    """Play one full match with a greedy agent; return per-hand outcome counts.
+
+    Returns {net, won, shot, drew, hands} where net is the agent's chip change
+    over the match and won/shot/drew count the agent's per-hand outcomes
+    (won = it completed the hand, shot = it discarded another player's winning
+    tile, drew = wall-exhausted hand).
+    """
+    from cracked.match import GameMatch
+    from cracked.engine import EventType
+
+    agent = RecordingPolicy(policy_fn, rng, greedy=True)
+    match = GameMatch(
+        n_rounds=n_rounds, human_initial_wind=int(agent_wind),
+        agent_policy=agent, seed=rng.randint(0, 2**31 - 1),
+    )
+    won = shot = drew = hands = 0
+    hand_guard = 0
+    max_hands = 4 * n_rounds * 8
+    while not match.is_complete and hand_guard < max_hands:
+        match.start_hand()
+        agent.reset_hand()
+        aw = match.agent_wind
+        engine = match.engine
+        outcome = None
+        step_guard = 0
+        while not engine.is_finished and step_guard < 4000:
+            for ev in engine.step():
+                if ev.type == EventType.WIN_SELF_DRAW and ev.seat == aw:
+                    outcome = "won"
+                elif ev.type == EventType.WIN_DISCARD:
+                    if ev.seat == aw:
+                        outcome = "won"
+                    elif ev.detail.get("shooter") == aw:
+                        outcome = "shot"
+                elif ev.type == EventType.WALL_EXHAUSTED:
+                    outcome = "drew"
+            step_guard += 1
+        match.finish_hand()
+        hands += 1
+        if outcome == "won":
+            won += 1
+        elif outcome == "shot":
+            shot += 1
+        elif outcome == "drew":
+            drew += 1
+        hand_guard += 1
+
+    return {"net": match.agent_chips - STARTING_CHIPS,
+            "won": won, "shot": shot, "drew": drew, "hands": hands}
+
+
 def evaluate_vs_heuristic(
     actor_critic,
-    n_games: int = 100,
+    n_games: int = 20,
     seed: int = 0,
     my_seat: int = Wind.EAST,
     prevailing_wind: int = Wind.EAST,
+    n_rounds: int = 4,
 ) -> dict:
     """
-    Play n_games of learning agent vs three heuristic opponents.
+    Play n_games full matches of the greedy agent vs three heuristic opponents.
 
-    Returns {win_rate, shoot_rate, draw_rate, mean_net}.
+    mean_net is the average chip change per match (the training objective);
+    win/shoot/draw rates are per-hand diagnostics. The agent rotates across all
+    starting seats. Requires torch (the policy network).
     """
+    policy_fn = _torch_policy_fn(actor_critic)
     rng = random.Random(seed)
     _WINDS = [int(Wind.EAST), int(Wind.SOUTH), int(Wind.WEST), int(Wind.NORTH)]
-    win = shoot = draw = 0
     total_net = 0.0
+    won = shot = drew = hands = 0
 
     for i in range(n_games):
-        ep_seat = _WINDS[i % 4]  # rotate evenly across all seats
-        ep = collect_episode(actor_critic, rng, ep_seat, prevailing_wind)
-        r = ep.terminal_reward
-        total_net += r
-        if r > 0:
-            win += 1
-        elif r < 0:
-            shoot += 1
-        else:
-            draw += 1
+        r = play_eval_match(policy_fn, rng, n_rounds=n_rounds, agent_wind=_WINDS[i % 4])
+        total_net += r["net"]
+        won += r["won"]; shot += r["shot"]; drew += r["drew"]; hands += max(r["hands"], 0)
 
+    denom = max(hands, 1)
     return {
-        "win_rate": win / n_games,
-        "shoot_rate": shoot / n_games,
-        "draw_rate": draw / n_games,
-        "mean_net": total_net / n_games,
+        "win_rate": won / denom,
+        "shoot_rate": shot / denom,
+        "draw_rate": drew / denom,
+        "mean_net": total_net / max(n_games, 1),
     }
 
 
@@ -695,7 +568,7 @@ def train_self_play(
     seed: int = 0,
     verbose: bool = True,
     eval_every: int = 500,
-    eval_games: int = 200,
+    eval_games: int = 20,
     shaping_scale: float = SHAPING_SCALE,
     defense_weight: float = DEFENSE_WEIGHT,
     resume: bool = False,
@@ -704,13 +577,16 @@ def train_self_play(
     waiting_bonus: float = 0.0,
     reward_scale: float = 1.0,
     ent_coef: float = ENT_COEF,
-    oracle_coef: float = 0.0,
+    n_rounds: int = 4,
 ) -> dict:
     """
-    Train ActorCritic via self-play against heuristic opponents.
+    Train ActorCritic by playing full matches inside the real game engine
+    against three fixed-weight heuristic opponents (HeuristicPolicy).
 
-    Uses potential-based reward shaping (PBRS) derived from tiles_away
-    proximity and tai-potential to give the agent dense learning signal.
+    Each episode is one complete GameMatch; the reward is the agent's true net
+    chip change over the match (real scoring), so the policy optimizes chip
+    count over a whole game. Potential-based reward shaping (PBRS, kept within
+    each hand) plus optional defense/progress terms give a dense signal.
 
     Saves the best checkpoint (by mean_net in evaluation) to model_path.
     Pass resume=True to continue from an existing checkpoint at model_path.
@@ -723,6 +599,7 @@ def train_self_play(
 
     model = ActorCritic()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    policy_fn = _torch_policy_fn(model)  # closes over model; reflects live weights
 
     if resume and Path(model_path).exists():
         ckpt = torch.load(Path(model_path), map_location="cpu", weights_only=True)
@@ -748,14 +625,13 @@ def train_self_play(
     _WINDS = [int(Wind.EAST), int(Wind.SOUTH), int(Wind.WEST), int(Wind.NORTH)]
 
     for ep_num in range(1, n_episodes + 1):
-        ep_seat = rng.choice(_WINDS)  # train from all seats equally
-        # Anneal oracle guiding linearly from oracle_coef → 0 over training.
-        cur_oracle = oracle_coef * max(0.0, 1.0 - (ep_num - 1) / max(n_episodes - 1, 1))
+        ep_seat = rng.choice(_WINDS)  # agent starts from all seats equally
         episode_buffer.append(
-            collect_episode(model, rng, my_seat=ep_seat, shaping_scale=shaping_scale,
-                            defense_weight=defense_weight, tiles_away_reward=tiles_away_reward,
-                            waiting_bonus=waiting_bonus, reward_scale=reward_scale,
-                            oracle_coef=cur_oracle)
+            collect_match_episode(
+                policy_fn, rng, n_rounds=n_rounds, agent_wind=ep_seat,
+                defense_weight=defense_weight, tiles_away_reward=tiles_away_reward,
+                waiting_bonus=waiting_bonus, reward_scale=reward_scale,
+            )
         )
 
         if len(episode_buffer) >= episodes_per_update:
@@ -775,7 +651,7 @@ def train_self_play(
 
         if ep_num % eval_every == 0:
             model.eval()
-            stats = evaluate_vs_heuristic(model, n_games=eval_games, seed=ep_num)
+            stats = evaluate_vs_heuristic(model, n_games=eval_games, seed=ep_num, n_rounds=n_rounds)
             model.train()
             last_stats = stats
             if verbose:
@@ -804,13 +680,18 @@ def train_self_play(
 def _cli():
     import argparse
     parser = argparse.ArgumentParser(description="Self-play RL training.")
-    parser.add_argument("--episodes", type=int, default=5000)
-    parser.add_argument("--batch", type=int, default=32)
+    parser.add_argument("--episodes", type=int, default=5000,
+                        help="Number of full matches to train on")
+    parser.add_argument("--batch", type=int, default=32,
+                        help="Matches collected per PPO update")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--out", type=Path, default=Path("models/policy.pt"))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--eval-every", type=int, default=500)
-    parser.add_argument("--eval-games", type=int, default=200)
+    parser.add_argument("--eval-games", type=int, default=20,
+                        help="Matches per evaluation")
+    parser.add_argument("--n-rounds", type=int, default=4,
+                        help="Table-wind rounds per match (4 = full E/S/W/N game)")
     parser.add_argument("--shaping-scale", type=float, default=SHAPING_SCALE,
                         help="PBRS reward shaping weight (0 = off)")
     parser.add_argument("--defense-weight", type=float, default=DEFENSE_WEIGHT,
@@ -825,8 +706,6 @@ def _cli():
                         help="Scale all rewards by this factor (e.g. 1/48 normalises to [-1,+1])")
     parser.add_argument("--ent-coef", type=float, default=ENT_COEF,
                         help="Entropy coefficient in PPO loss")
-    parser.add_argument("--oracle-coef", type=float, default=0.0,
-                        help="Oracle-guiding strength, annealed to 0 over training (0 = off)")
     parser.add_argument("--resume", action="store_true",
                         help="Continue training from existing checkpoint at --out path")
     args = parser.parse_args()
@@ -845,7 +724,7 @@ def _cli():
         waiting_bonus=args.waiting_bonus,
         reward_scale=args.reward_scale,
         ent_coef=args.ent_coef,
-        oracle_coef=args.oracle_coef,
+        n_rounds=args.n_rounds,
         resume=args.resume,
     )
 

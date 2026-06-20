@@ -18,7 +18,10 @@ ml = [
     "torch>=2.1",
 ]
 ui = [
-    "textual>=0.50",
+    "textual>=0.87",
+]
+game = [
+    "pygame-ce>=2.5",
 ]
 dev = [
     "pytest>=7.4",

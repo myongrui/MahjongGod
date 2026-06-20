@@ -119,17 +119,6 @@ VARIANTS: dict[str, dict] = {
         "defense_weight": DEFENSE_WEIGHT,
         "ent_coef": 0.001,
     },
-    "oracle_warmstart": {
-        "description": "Suphx-style oracle guiding: perfect-info shaping, annealed to 0",
-        "gamma": 0.99,
-        "tiles_away_reward": 0.0,
-        "waiting_bonus": 0.0,
-        "reward_scale": 1.0,
-        "shaping_scale": SHAPING_SCALE,
-        "defense_weight": DEFENSE_WEIGHT,
-        "ent_coef": ENT_COEF,
-        "oracle_coef": 1.0,
-    },
 }
 
 
@@ -155,7 +144,7 @@ def run_experiments(
     out_dir: Path = Path("models"),
     episodes_per_update: int = 32,
     eval_every: int = 500,
-    eval_games: int = 200,
+    eval_games: int = 20,
     seed: int = 0,
     resume: bool = False,
 ) -> dict[str, dict]:
@@ -193,7 +182,6 @@ def run_experiments(
             "waiting_bonus": cfg["waiting_bonus"],
             "reward_scale": cfg["reward_scale"],
             "ent_coef": cfg["ent_coef"],
-            "oracle_coef": cfg.get("oracle_coef", 0.0),
             "resume": resume,
         })
 
@@ -270,8 +258,8 @@ def _cli() -> None:
                         help="Episodes per PPO update batch (default: 32).")
     parser.add_argument("--eval-every", type=int, default=500,
                         help="Evaluate every N episodes (default: 500).")
-    parser.add_argument("--eval-games", type=int, default=200,
-                        help="Games per evaluation (default: 200).")
+    parser.add_argument("--eval-games", type=int, default=20,
+                        help="Matches per evaluation (default: 20).")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action="store_true",
                         help="Resume each variant from its existing checkpoint in --out-dir.")

@@ -19,15 +19,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
-import numpy as np
-
 from cracked.tiles import NTILES, Wind, tile_name, is_bonus_tile, is_animal
 from cracked.hand import HandState, Meld, MeldType
 from cracked.game_state import GameState, PlayerView
 from cracked.tiles_away import tiles_away
 from cracked.scoring import calculate_tai, WinContext, chip_payment, STARTING_CHIPS
-from cracked.simulator import SimHand, _heuristic_discard
 from cracked.optimizer import recommend_discard, DiscardRecommendation
+from cracked.policy import Policy, HumanPolicy, HeuristicPolicy
 
 _WIND_ORDER: list[int] = [int(Wind.EAST), int(Wind.SOUTH), int(Wind.WEST), int(Wind.NORTH)]
 _BONUS_TILES: list[int] = list(range(34, 46))   # one of each (12 total)
@@ -58,7 +56,6 @@ class PlayerState:
     seat:     int
     hand:     HandState
     discards: list[int] = field(default_factory=list)
-    is_human: bool = False
 
 
 class GameEngine:
@@ -77,10 +74,23 @@ class GameEngine:
         human_seats: Optional[set[int]] = None,
         prevailing_wind: int = int(Wind.EAST),
         seed: Optional[int] = None,
+        policies: Optional[dict[int, Policy]] = None,
     ) -> None:
         self._human_seats: set[int] = human_seats or set()
         self.prevailing_wind = prevailing_wind
         self._rng = random.Random(seed)
+
+        # One policy per seat. Explicit policies win; otherwise human seats get a
+        # HumanPolicy (await external input) and the rest the risk-aware bot.
+        explicit = policies or {}
+        self.policies: dict[int, Policy] = {}
+        for seat in _WIND_ORDER:
+            if seat in explicit:
+                self.policies[seat] = explicit[seat]
+            elif seat in self._human_seats:
+                self.policies[seat] = HumanPolicy()
+            else:
+                self.policies[seat] = HeuristicPolicy()
 
         self.players: dict[int, PlayerState] = {}
         self.chips: dict[int, int] = {}
@@ -139,9 +149,7 @@ class GameEngine:
                 else:
                     hand.add_tile(tid)
                     dealt += 1
-            self.players[seat] = PlayerState(
-                seat=seat, hand=hand, is_human=(seat in self._human_seats)
-            )
+            self.players[seat] = PlayerState(seat=seat, hand=hand)
 
         self.chips = {seat: STARTING_CHIPS for seat in _WIND_ORDER}
         self._phase = "playing"
@@ -194,12 +202,13 @@ class GameEngine:
                                         detail={"tai": tai_result.total, "zimo_pay": zimo_pay}))
                 return events
 
-        if player.is_human:
+        choice = self.policies[seat].choose_discard(self.player_view_for(seat))
+        if choice is None:
             self._awaiting_discard = True
             events.append(GameEvent(EventType.AWAIT_DISCARD, seat=seat, tile=drawn))
             return events
 
-        events.extend(self._execute_discard(seat))
+        events.extend(self._execute_discard(seat, forced=choice))
         return events
 
     def submit_discard(self, tile_id: int) -> list[GameEvent]:
@@ -281,8 +290,12 @@ class GameEngine:
         if forced is not None:
             tid = forced
         else:
-            sim = SimHand(player.hand.concealed.copy(), len(player.hand.melds), seat)
-            tid = _heuristic_discard(sim)
+            # Reached only after a claim, where the discarder is always an
+            # auto seat (humans never claim), so the policy returns a tile.
+            choice = self.policies[seat].choose_discard(self.player_view_for(seat))
+            if choice is None:
+                raise RuntimeError(f"policy for seat {seat} returned no discard")
+            tid = choice
 
         player.hand.remove_tile(tid)
         player.discards.append(tid)
@@ -321,64 +334,37 @@ class GameEngine:
         return events
 
     def _check_claims(self, discard_tid: int, discarder_seat: int) -> list[GameEvent]:
-        """Return claim events if any AI player wants to pong/kong/chow, else []."""
+        """Return claim events if any seat's policy wants to pong/kong/chow, else []."""
         discarder_idx = _WIND_ORDER.index(discarder_seat)
 
         # Pong / Kong: clockwise priority from discarder
         for offset in range(1, 4):
             claimer_seat = _WIND_ORDER[(discarder_idx + offset) % 4]
-            claimer = self.players[claimer_seat]
-            if claimer.is_human:
+            count = int(self.players[claimer_seat].hand.concealed[discard_tid])
+            if count < 2:
                 continue
-            count = int(claimer.hand.concealed[discard_tid])
-            if count >= 3 and self._ai_wants_kong(claimer_seat, discard_tid):
+            view = self.player_view_for(claimer_seat)
+            policy = self.policies[claimer_seat]
+            if count >= 3 and policy.wants_kong(view, discard_tid):
                 return self._do_kong(claimer_seat, discarder_seat, discard_tid)
-            if count >= 2 and self._ai_wants_pong(claimer_seat, discard_tid):
+            if policy.wants_pong(view, discard_tid):
                 return self._do_pong(claimer_seat, discarder_seat, discard_tid)
 
         # Chow: left player only
         left_seat = _WIND_ORDER[(discarder_idx + 1) % 4]
-        if not self.players[left_seat].is_human:
-            chow = self._pick_best_chow(left_seat, discard_tid)
+        options = self._find_chow_options(self.players[left_seat].hand, discard_tid)
+        if options:
+            chow = self.policies[left_seat].choose_chow(
+                self.player_view_for(left_seat), discard_tid, options
+            )
             if chow:
                 return self._do_chow(left_seat, discarder_seat, discard_tid, chow)
 
         return []
 
     # ------------------------------------------------------------------
-    # Internal: AI claim decisions
+    # Internal: claim option enumeration (decisions live in seat policies)
     # ------------------------------------------------------------------
-
-    def _ai_wants_pong(self, seat: int, tile: int) -> bool:
-        """True if ponging and then making the best discard maintains or improves tiles_away."""
-        player = self.players[seat]
-        current_s = tiles_away(player.hand.concealed, len(player.hand.melds))
-        if current_s == -1:
-            return False
-        test = player.hand.concealed.copy()
-        test[tile] -= 2
-        test_melds = len(player.hand.melds) + 1
-        best_s = min(
-            (tiles_away(test - np.eye(NTILES, dtype=np.int8)[t], test_melds)
-             for t in range(NTILES) if test[t] > 0),
-            default=current_s,
-        )
-        return best_s <= current_s
-
-    def _ai_wants_kong(self, seat: int, tile: int) -> bool:
-        """True if the hand structure is not significantly worsened by konging
-        (replacement draw compensates for one extra step)."""
-        player = self.players[seat]
-        current_s = tiles_away(player.hand.concealed, len(player.hand.melds))
-        test = player.hand.concealed.copy()
-        test[tile] -= 3
-        test_melds = len(player.hand.melds) + 1
-        best_s = min(
-            (tiles_away(test - np.eye(NTILES, dtype=np.int8)[t], test_melds)
-             for t in range(NTILES) if test[t] > 0),
-            default=current_s,
-        )
-        return best_s <= current_s + 1
 
     def _find_chow_options(self, hand: HandState, tile: int) -> list[tuple[int, int, int]]:
         """All valid chow combinations for claiming the given suited tile."""
@@ -394,31 +380,6 @@ class GameEngine:
             if all(hand.concealed[t] > 0 for t in (t1, t2, t3) if t != tile):
                 options.append((t1, t2, t3))
         return options
-
-    def _pick_best_chow(self, seat: int, tile: int) -> Optional[tuple[int, int, int]]:
-        """Return the chow option that strictly improves tiles_away, or None."""
-        player = self.players[seat]
-        options = self._find_chow_options(player.hand, tile)
-        if not options:
-            return None
-        current_s = tiles_away(player.hand.concealed, len(player.hand.melds))
-        best_option: Optional[tuple[int, int, int]] = None
-        best_s = current_s  # chow requires strict improvement
-        eye = np.eye(NTILES, dtype=np.int8)
-        for chow_tiles in options:
-            test = player.hand.concealed.copy()
-            for t in chow_tiles:
-                if t != tile:
-                    test[t] -= 1
-            test_melds = len(player.hand.melds) + 1
-            min_s = min(
-                (tiles_away(test - eye[t], test_melds) for t in range(NTILES) if test[t] > 0),
-                default=current_s,
-            )
-            if min_s < best_s:
-                best_s = min_s
-                best_option = chow_tiles
-        return best_option
 
     # ------------------------------------------------------------------
     # Internal: executing claims

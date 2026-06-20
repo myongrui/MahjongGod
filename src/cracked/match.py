@@ -23,6 +23,7 @@ from typing import Optional
 
 from cracked.tiles import Wind
 from cracked.engine import GameEngine, GameEvent
+from cracked.policy import Policy
 from cracked.scoring import STARTING_CHIPS
 
 _E = int(Wind.EAST)
@@ -65,9 +66,17 @@ class GameMatch:
         n_rounds: int = 4,
         human_initial_wind: Optional[int] = None,
         seed: Optional[int] = None,
+        agent_policy: Optional[Policy] = None,
     ) -> None:
         self.n_rounds = n_rounds
         self._seed = seed
+
+        # Optional learning/AI agent occupying the tracked rotating seat. When
+        # set, that seat is driven by agent_policy instead of being a human seat
+        # (so the engine never pauses for AWAIT_DISCARD). The seat label rotates
+        # with the match like any tracked player; the agent stays one physical
+        # player throughout.
+        self._agent_policy = agent_policy
 
         # Chips keyed by current wind constant.
         # After a rotation the chip balance moves with the physical player.
@@ -85,10 +94,14 @@ class GameMatch:
         self._total_hands: int = 0
         self._rounds_completed: int = 0
 
-        # Human player's current wind label (changes on each rotation).
+        # Tracked player's current wind label (changes on each rotation). This
+        # seat is either a human (HumanPolicy) or, when agent_policy is set, the
+        # agent. Defaults to East when an agent is given without an explicit wind.
         self._human_wind: Optional[int] = (
             int(human_initial_wind) if human_initial_wind is not None else None
         )
+        if self._agent_policy is not None and self._human_wind is None:
+            self._human_wind = _E
 
         self.engine: Optional[GameEngine] = None
         self.is_complete: bool = False
@@ -105,8 +118,20 @@ class GameMatch:
 
     @property
     def human_wind(self) -> Optional[int]:
-        """Current wind constant for the human player, or None (all AI)."""
+        """Current wind constant for the tracked player, or None (all AI)."""
         return self._human_wind
+
+    @property
+    def agent_wind(self) -> Optional[int]:
+        """Current wind of the injected agent, or None if no agent_policy."""
+        return self._human_wind if self._agent_policy is not None else None
+
+    @property
+    def agent_chips(self) -> Optional[int]:
+        """Current chip balance of the injected agent (chips follow the player)."""
+        if self._agent_policy is None or self._human_wind is None:
+            return None
+        return self.chips[self._human_wind]
 
     @property
     def round_label(self) -> str:
@@ -119,12 +144,19 @@ class GameMatch:
 
     def start_hand(self) -> list[GameEvent]:
         """Create a fresh GameEngine for the current hand and deal tiles."""
-        human_seats = {self._human_wind} if self._human_wind is not None else None
         seed = (self._seed + self._total_hands) if self._seed is not None else None
+        if self._agent_policy is not None:
+            # Agent occupies the tracked seat with its own policy (no human pause).
+            human_seats = None
+            policies = {self._human_wind: self._agent_policy}
+        else:
+            human_seats = {self._human_wind} if self._human_wind is not None else None
+            policies = None
         self.engine = GameEngine(
             human_seats=human_seats,
             prevailing_wind=self.table_wind,
             seed=seed,
+            policies=policies,
         )
         events = self.engine.deal()
         # Inject persistent chip balances after deal() to override its reset.

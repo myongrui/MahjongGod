@@ -102,7 +102,7 @@ python -m cracked.training.self_play --episodes 5000 --out models/policy.pt
 
 ## Architecture
 
-All 8 phases are complete. The stack is: heuristic engine (phases 1–5) → Monte Carlo simulator (phase 6) → supervised DangerNet (phase 7) → self-play RL ActorCritic (phase 8).
+All 8 phases are complete. The stack is: heuristic engine (phases 1–5) → Monte Carlo simulator (phase 6) → supervised DangerNet (phase 7) → self-play RL ActorCritic (phase 8). The ActorCritic now trains **inside the real engine** over full 16-hand matches (`GameMatch`): the agent occupies one rotating seat against three fixed-weight `HeuristicPolicy` opponents, real `calculate_tai` scoring drives chip payments, and the episode reward is the agent's net chip change over the match.
 
 ### Tile Encoding (`src/cracked/tiles.py`)
 
@@ -217,19 +217,20 @@ CLI tests use Click's `CliRunner` with `monkeypatch` to isolate state files — 
 | `WALL_EXHAUSTED` | Wall empty — draw game |
 | `AWAIT_DISCARD` | Human player's turn — call `submit_discard()` |
 
-**Claim priority**: Ron (any discard completes hand) > Pong/Kong (clockwise) > Chow (left player only). Human players skip claim opportunities (no claim UI yet).
+**Claim priority**: Ron (any discard completes hand) > Pong/Kong (clockwise) > Chow (left player only). The engine owns priority, option enumeration (`_find_chow_options`), and claim *execution*; the *decision* to claim belongs to the seat's policy. Ron is always taken by the engine (not a policy choice).
 
-**AI claim heuristics**: `_ai_wants_pong()` accepts if best post-pong discard maintains or improves tiles away; `_ai_wants_kong()` allows up to one extra tiles-away step (replacement compensates); `_pick_best_chow()` requires strict tiles-away improvement.
+**Seat policies** (`src/cracked/policy.py`): each seat is driven by a `Policy` — `choose_discard(view)` (return a tile, or `None` to await external input) plus `wants_pong` / `wants_kong` / `choose_chow`. `GameEngine(policies=...)` overrides per seat; otherwise human seats get `HumanPolicy` (defers discard to `submit_discard`, never claims) and the rest get `HeuristicPolicy` — the fixed-weight risk-aware bot backed by `recommend_discard` (danger + opponent modeling), with claim rules that maintain/improve tiles away (kong allows one extra step; chow requires strict improvement). `ModelPolicy` (`training/policy_model.py`, torch-lazy) slots a trained ActorCritic into a seat; it picks discards from the policy net and currently delegates claims to a heuristic placeholder.
 
 ### Module Dependency Order
 
 ```
 tiles → hand → tiles_away → scoring → game_state → danger → opponent_model → optimizer → cli
                                                                         ↘ simulator ↗
-                                                          optimizer + simulator → engine → match → tui_game
+                                                          optimizer → policy → engine → match → tui_game
                                                                         optimizer → tui
                                               training/features → training/model → training/trainer
-                                              training/features → training/self_play
+                                  match + policy + training/features → training/self_play
+                                              training/features + policy → training/policy_model
 ```
 
 ### Match Manager (`src/cracked/match.py`)
