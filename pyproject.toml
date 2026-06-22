@@ -23,6 +23,10 @@ ui = [
 game = [
     "pygame-ce>=2.5",
 ]
+threed = [
+    "ursina>=6.0",
+    "pillow>=10.0",
+]
 dev = [
     "pytest>=7.4",
     "pytest-cov>=4.1",
