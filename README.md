@@ -11,8 +11,11 @@ pip install -e ".[dev]"
 # With PyTorch (for ML training and self-play)
 pip install -e ".[dev,ml]"
 
-# With Textual TUI
+# With Textual TUI advisor
 pip install -e ".[dev,ui]"
+
+# With the 3D game (Ursina)
+pip install -e ".[dev,threed]"
 ```
 
 ## Tile notation
@@ -118,65 +121,33 @@ Shows predictions from a trained DangerNet alongside the heuristic table. Requir
 
 ---
 
-## TUI modes
+## TUI advisor (`cracked-ui`)
 
 Requires `pip install -e ".[ui]"` (adds the `textual` package).
 
 ```bash
-# Advisor mode — enter your hand and draws, get heuristic + Monte Carlo recommendations
 cracked-ui
-
-# Game viewer — choose spectator or interactive mode
-cracked-play
-
-# Spatial table-view prototype (static preview, no engine yet)
-python -m cracked.tui_table          # hybrid: glyph hands + custom-face melds
-python -m cracked.tui_table_faces    # variant: every tile uses the custom faces
-
-# Animation demo — tiles thrown into the centre (engine-free preview)
-python -m cracked.tui_anim_demo
-
-# Physics demo — rotating tiles collide & bounce (engine-free tech demo)
-python -m cracked.tui_physics_demo
 ```
-
-### Graphical (pygame-ce) prototype
-
-A real 2D-graphics front-end (vs the terminal TUIs). Requires `pip install -e ".[game]"`.
-
-```bash
-python -m cracked.pygame_table        # desktop window — 2.5D table
-python -m cracked.pygame_physics       # bouncing/rotating/colliding tiles (space = re-scatter)
-```
-
-The table is dealt by the real engine; tiles are the custom `tui_tiles` faces
-rendered as crisp nearest-scaled sprites; a discard animates into the centre.
-The loop is written async, so the same code can be packaged for the browser with
-[`pygbag`](https://pypi.org/project/pygbag/) (`pygbag src/cracked/pygame_table.py`).
-
-> **`python -m cracked.tui_table`** is an early, static prototype of a redesigned
-> "real mahjong table" look — you at the bottom, opponents on the other sides, a
-> shared discard pool and the wall in the centre, melds in front of each player,
-> colored tiles, table wind and per-seat chips on the felt. It is driven by
-> hard-coded sample data (no game logic) to preview the layout before it is wired
-> to the live engine and animated.
-
-### Advisor mode (`cracked-ui`)
 
 Enter any 13-tile hand and a draw tile. Press **R** to get ranked discard recommendations (tiles away, acceptance tiles, danger score, utility). Press **S** to run Monte Carlo simulation. Use the seat and prevailing wind dropdowns.
 
-### Game viewer (`cracked-play`)
+---
 
-On launch, choose a mode:
+## 3D game (Ursina)
 
-**Spectator** — watch four AI bots play a full game. Each bot is driven by a seat `Policy` (`src/cracked/policy.py`); the default `HeuristicPolicy` plays the full risk-aware heuristic (danger scoring + opponent modeling via `recommend_discard`), not just tiles-away minimization. Claim mechanics (pong, kong, chow) are live: bots evaluate each discard and claim when it improves their hand. Bonus tiles (flowers, seasons, animals) are drawn and replaced automatically. Adjust speed or pause at any time.
+A real-time 3D mahjong table driven by the live engine. Requires `pip install -e ".[threed]"` (adds `ursina` + `pillow`).
 
-**Interactive** — you play as East against three AI opponents. The engine pauses on your turn, shows ranked discard recommendations, and accepts tile names (`b1`, `ew`, `rd`, etc.) as input. Opponents claim your discards using the same heuristic.
+```bash
+python -m cracked.ursina_game        # Menu → Spectate (watch the AI play)
+```
 
-Both modes show:
-- Each player's concealed tiles (glyphs + labels), tiles-away / waiting status, and potential tai range
-- Exposed melds (pong/kong/chow) and bonus tiles (flowers/seasons green, animals yellow) above the hand
-- Discard piles and a live game log with claim announcements
+**Spectator** — watch four AI bots play a full match. Each seat is driven by a `Policy` (`src/cracked/policy.py`); the default `HeuristicPolicy` plays the full risk-aware heuristic (danger scoring + opponent modeling via `recommend_discard`), not just tiles-away minimization. Claim mechanics (pong, kong, chow) are live, and bonus tiles (flowers, seasons, animals) are drawn and replaced automatically.
+
+The table renders the custom `tui_tiles` pixel-art faces as textures, with seats arranged **anti-clockwise** (E→S→W→N) as on a real table. Discards are thrown into a central pool with slide-and-collide physics; exposed melds and bonus tiles lie face-up in front of each player, facing the owner. A left panel shows the table wind, current seat, chips, and tiles left in the wall; a right panel shows a rolling action log. Drag to orbit, scroll to zoom.
+
+> Interactive play (you at East, click-to-discard, pong/kong/chow/hu prompts) is the next pass; the menu's **Play** button is a placeholder until the engine gains a claim-await hook.
+>
+> `python -m cracked.ursina_table` runs the original static 3D prototype (one dealt scene, no game loop) that `ursina_game` is built on.
 
 ---
 
@@ -317,9 +288,13 @@ src/cracked/
 ├── optimizer.py       # Heuristic discard recommendations
 ├── simulator.py       # Monte Carlo game simulator
 ├── cli.py             # Click CLI (cracked)
-├── engine.py          # Turn-by-turn game state machine (drives TUI)
+├── engine.py          # Turn-by-turn game state machine (drives the game)
+├── match.py           # Multi-hand match manager (chips, seat rotation)
+├── policy.py          # Per-seat policies (HeuristicPolicy, HumanPolicy)
 ├── tui.py             # Textual TUI advisor mode (cracked-ui)
-├── tui_game.py        # Textual TUI watch mode (cracked-play)
+├── tui_tiles.py       # Custom pixel-art tile faces (shared by the 3D table)
+├── ursina_table.py    # 3D table prototype + tile model, lighting, discard physics
+├── ursina_game.py     # Live 3D game (python -m cracked.ursina_game)
 └── training/
     ├── features.py    # GameState → numpy feature vectors
     ├── model.py       # DangerNet (supervised residual MLP)

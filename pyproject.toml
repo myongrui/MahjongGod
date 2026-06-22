@@ -20,9 +20,6 @@ ml = [
 ui = [
     "textual>=0.87",
 ]
-game = [
-    "pygame-ce>=2.5",
-]
 threed = [
     "ursina>=6.0",
     "pillow>=10.0",
@@ -35,7 +32,6 @@ dev = [
 [project.scripts]
 cracked = "cracked.cli:cli"
 cracked-ui = "cracked.tui:main"
-cracked-play = "cracked.tui_game:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

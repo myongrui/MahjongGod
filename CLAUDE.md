@@ -189,7 +189,7 @@ Built with Click + Rich. All commands load/save state from the JSON file.
 | `cracked recommend [--deep] [--games N] [--log FILE] [--model PATH]` | Discard recommendations |
 | `cracked status` | Display the full game state |
 | `cracked-ui` | Textual TUI advisor mode (requires `.[ui]`) |
-| `cracked-play` | Textual TUI game viewer — spectator or interactive (requires `.[ui]`) |
+| `python -m cracked.ursina_game` | 3D game — spectator mode (requires `.[threed]`) |
 
 `recommend` flags: `--deep` runs Monte Carlo simulation and logs results; `--model PATH` shows DangerNet predictions (requires torch).
 
@@ -199,7 +199,7 @@ CLI tests use Click's `CliRunner` with `monkeypatch` to isolate state files — 
 
 ### Game Engine (`src/cracked/engine.py`)
 
-`GameEngine` is a synchronous turn-by-turn state machine that owns all 4 hands, the wall, and discard piles. It drives both TUI modes.
+`GameEngine` is a synchronous turn-by-turn state machine that owns all 4 hands, the wall, and discard piles. It drives the 3D game (`ursina_game`) and, via `GameMatch`, the self-play training loop.
 
 **Wall**: 148 tiles — 136 standard (4 copies each of 34 types) + 12 bonus tiles (flowers 34-37, seasons 38-41, animals 42-45). Bonus tiles drawn during play are set aside with a replacement drawn automatically.
 
@@ -226,8 +226,9 @@ CLI tests use Click's `CliRunner` with `monkeypatch` to isolate state files — 
 ```
 tiles → hand → tiles_away → scoring → game_state → danger → opponent_model → optimizer → cli
                                                                         ↘ simulator ↗
-                                                          optimizer → policy → engine → match → tui_game
+                                                          optimizer → policy → engine → match
                                                                         optimizer → tui
+                              tiles → tui_tiles → ursina_table → ursina_game   (3D game; reads match/engine)
                                               training/features → training/model → training/trainer
                                   match + policy + training/features → training/self_play
                                               training/features + policy → training/policy_model

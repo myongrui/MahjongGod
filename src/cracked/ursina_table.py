@@ -1,20 +1,18 @@
 """
 Ursina 3D front-end — proof-of-concept for the mahjong table.
 
-A *real* 3D scene (vs the pygame fake-2.5D): one tile is modelled as a cuboid with a
-cream body, a jade back and an optional printed face. The four hands are placed around
-the table with real transforms and a single perspective camera renders them all at
-once — so the per-seat tile-orientation problems the 2D renderer keeps fighting simply
-don't arise: each hand is the same row of tiles, just rotated 90° about the table and
-viewed through one camera. It reuses the same `GameEngine` deal and the `tui_tiles`
-pixel-art faces (rasterised into textures).
+A real 3D scene: one tile is modelled as a cuboid with a cream body, a jade back and an
+optional printed face. The four hands are placed around the table with real transforms
+and a single perspective camera renders them all at once — so per-seat tile-orientation
+problems don't arise: each hand is the same row of tiles, just rotated 90° about the
+table and viewed through one camera. It reuses the same `GameEngine` deal and the
+`tui_tiles` pixel-art faces (rasterised into textures).
 
     pip install -e ".[threed]"
     python -m cracked.ursina_table        # drag to orbit, scroll to zoom, esc to quit
 
-This is a deliberate sketch to compare against the pygame version. Colours use
-`color.hsv` (Ursina 8.x); on older Ursina the printed-face `Texture(pil_image)` step or
-the lit shader may need a one-line tweak — both degrade gracefully — but the scene
+Colours use `color.hsv` (Ursina 8.x); on older Ursina the printed-face `Texture(pil_image)`
+step or the lit shader may need a one-line tweak — both degrade gracefully — but the scene
 structure is the point.
 """
 from __future__ import annotations
@@ -45,25 +43,28 @@ from cracked.tui_tiles import make_face, FW, FH
 # tile size + table layout, in Ursina world units
 TW, TH, TD = 0.5, 0.72, 0.38            # tile width / height / thickness
 STEP = TW + 0.05                        # spacing between tiles in a hand
-EDGE = 5.4                              # distance of each hand from the table centre
+EDGE = 6.8                              # distance of each hand from the table centre (pushed to the rim)
 WALL_R = 4.3                            # the draw-wall ring sits just inside the hands
 N = 13                                  # tiles per concealed hand
 WALL_N = 17                             # tiles per wall side (built two courses high)
-FELT = 15                               # felt table size (square)
+FELT = 18                               # felt table size (square) — grown so the rim hands still fit
 
 # Fake "lamp above the centre" pool: since Ursina's point lights don't work here, we
 # tint each piece darker the further it sits from the table centre (rotation-invariant,
 # so the same factor applies to every seat). This rides on top of the directional shading.
-POOL_R = 7.0                            # radius over which the pool fades out
+POOL_R = 8.6                            # radius over which the pool fades out (covers the rim hands)
 POOL_FLOOR = 0.3               # dimmest the rim gets (not pure black)
 
-# discard into the centre (a la the pygame physics demo). Two styles:
+# discard into the centre. Two styles:
 #   "slide" — the tile slides flat across the felt, spinning, and friction stops it (active)
 #   "arc"   — it tosses up, tumbles under gravity, and lands face-up (kept for reference)
 THROW_G = -16.0                         # arc gravity (world units / s²)
 THROW_T = 0.7                           # arc flight time used to aim the toss
 SLIDE_A = 7.0                           # slide friction deceleration (world units / s²)
 THROW_REST_Y = TD / 2 + 0.01            # resting height of a tile lying flat
+BOX_HALF = 3.4                          # half-extent of the invisible centre box discards stay inside
+                                        # (sized to hold a full hand of discards without spilling)
+TILE_PAD = 0.03                         # collision margin so resting tiles keep a small gap, not just touch
 
 _tex_cache: dict = {}
 
@@ -131,6 +132,10 @@ def _face_texture(tid: int):
                 c = face[y][x]
                 if c is not None:
                     px[x, y] = (*_hex_rgb(c), 255)
+        # the front hand's holder is rotated 180°, which mirrors the face left-right when
+        # viewed by the player camera — pre-flip the texture horizontally so it reads
+        # correctly (un-mirrored) on a hand tile
+        img = img.transpose(Image.FLIP_LEFT_RIGHT)
         img = img.resize((FW * 10, FH * 10), Image.NEAREST)   # crisp pixels
         tex = Texture(img)
     except Exception:
@@ -164,6 +169,19 @@ def _felt_texture():
         tex = None
     _tex_cache["felt"] = tex
     return tex
+
+
+def destroy_tree(e):
+    """Destroy an entity and all of its children, depth-first.
+
+    Ursina's own `destroy()` does NOT recurse into `.children` (that code is
+    commented out in ursina/destroy.py) — it only handles `loose_children`. So a
+    multi-part entity like a tile (body + back + face children) leaks those child
+    Entities into `scene.entities` on destroy. Use this for anything we build with
+    `make_tile` so the whole subtree is actually freed."""
+    for c in list(e.children):
+        destroy_tree(c)
+    destroy(e)
 
 
 def make_tile(tid=None, reveal=False, parent=None, bright: float = 1.0):
@@ -220,15 +238,18 @@ def place_wall(seat: int):
     return holder
 
 
-def build_scene(reveal_all: bool = False):
-    """Felt table + the four dealt hands. Returns nothing; just populates the scene."""
-    # dim felt slab (for the table's thickness/edge) + a radial-gradient top so the
-    # centre of the cloth glows and the rim falls dark — the lamp's pool on the felt
+def build_felt():
+    """The felt table: a dim slab for the table's thickness/edge + a radial-gradient top
+    so the centre of the cloth glows and the rim falls dark (the lamp's pool on the felt)."""
     Entity(model="cube", scale=(FELT, 0.3, FELT), position=(0, -0.15, 0),
            color=_felt(POOL_FLOOR), shader=_LIT)
     Entity(model="plane", scale=(FELT, 1, FELT), position=(0, 0.005, 0),
            texture=_felt_texture(), color=color.white)
 
+
+def build_scene(reveal_all: bool = False):
+    """Felt table + the four dealt hands. Returns nothing; just populates the scene."""
+    build_felt()
     eng = GameEngine(human_seats={int(Wind.EAST)}, seed=7)
     eng.deal()
     # you sit at East (front); going clockwise on screen: right=South, across=West, left=North
@@ -246,28 +267,32 @@ if _HAVE_URSINA:
         flat across the felt, spinning, with friction bringing it to rest; `mode="arc"`
         keeps the older toss-and-tumble (lands face-up). The 3D take on the physics demo."""
 
-        def __init__(self, mode: str = "slide", max_pile: int = 28):
+        def __init__(self, mode: str = "slide", auto: bool = True):
             super().__init__()
             self.mode = mode
-            self.max_pile = max_pile
+            self.auto = auto               # auto=False → caller drives throw() (the live game)
             self._t = 1.0
             self._slide: list = []         # [entity, vx, vz, yaw_rate, launch_speed]
             self._pile: list = []          # resting discards: [entity, x, z, yaw_rad]
             self._arc: list = []           # [entity, velocity, angular_velocity]
+            self.obstacles: list = []      # extra static boxes (cx, cz, yaw, hw, hh) to collide with
 
         def update(self):
-            self._t += time.dt
-            if self._t >= 1.6:
-                self._t = 0.0
-                (self._toss_slide if self.mode == "slide" else self._toss_arc)()
+            if self.auto:
+                self._t += time.dt
+                if self._t >= 1.6:
+                    self._t = 0.0
+                    (self._toss_slide if self.mode == "slide" else self._toss_arc)()
             self._advance_slide()
+            self._relax_pile()
             self._advance_arc()
 
-        # -- slide: flat across the felt, spinning, colliding with the pile (active) ---
-        def _toss_slide(self):
-            tid = random.randint(0, 33)
-            start = Vec3(random.uniform(-2.0, 2.0), THROW_REST_Y, -EDGE + 1.0)
-            target = Vec3(random.uniform(-1.6, 1.6), THROW_REST_Y, random.uniform(-1.6, 1.6))
+        def throw(self, tid, start, target=None):
+            """Slide tile `tid` flat from world `start` into the centre (or `target`),
+            spinning, colliding with the resting pile. Used for real discards."""
+            if target is None:
+                s = BOX_HALF - 0.5                              # spread aims across the box, not its centre
+                target = Vec3(random.uniform(-s, s), THROW_REST_Y, random.uniform(-s, s))
             e = Entity(position=start, rotation=Vec3(-90, random.uniform(0, 360), 0))
             make_tile(tid, reveal=True, parent=e, bright=0.9)   # flat, face-up
             dx, dz = target.x - start.x, target.z - start.z
@@ -275,10 +300,39 @@ if _HAVE_URSINA:
             speed = math.sqrt(2 * SLIDE_A * dist) * 1.15        # a little extra for bounces
             yaw = random.uniform(160, 320) * random.choice((-1, 1))
             self._slide.append([e, dx / dist * speed, dz / dist * speed, yaw, speed])
+            return e
+
+        # -- slide: flat across the felt, spinning, colliding with the pile (active) ---
+        def _toss_slide(self):
+            start = Vec3(random.uniform(-2.0, 2.0), THROW_REST_Y, -EDGE + 1.0)
+            self.throw(random.randint(0, 33), start)
+
+        def _relax_pile(self):
+            """Separate any overlapping resting discards a little each frame, so tiles that
+            came to rest on top of each other spread apart instead of staying overlapped.
+            One light pass per frame; overlaps clear over a few frames without jitter."""
+            hw, hh = TW / 2 + TILE_PAD, TH / 2 + TILE_PAD
+            reach2 = (2 * math.hypot(hw, hh)) ** 2          # centres farther than this can't overlap
+            p = self._pile
+            for i in range(len(p)):
+                a = p[i]
+                for j in range(i + 1, len(p)):
+                    b = p[j]
+                    if (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2 > reach2:
+                        continue                            # quick reject before the SAT test
+                    hit = _sat2d((a[1], a[2], a[3], hw, hh), (b[1], b[2], b[3], hw, hh))
+                    if hit is None:
+                        continue
+                    nx, nz, depth = hit                     # normal points a → b
+                    sh = depth * 0.5                        # push each tile half the overlap apart
+                    b[0].x = b[1] = min(BOX_HALF, max(-BOX_HALF, b[1] + nx * sh))
+                    b[0].z = b[2] = min(BOX_HALF, max(-BOX_HALF, b[2] + nz * sh))
+                    a[0].x = a[1] = min(BOX_HALF, max(-BOX_HALF, a[1] - nx * sh))
+                    a[0].z = a[2] = min(BOX_HALF, max(-BOX_HALF, a[2] - nz * sh))
 
         def _advance_slide(self):
             dt = time.dt
-            hw, hh = TW / 2, TH / 2
+            hw, hh = TW / 2 + TILE_PAD, TH / 2 + TILE_PAD
             for f in self._slide[:]:
                 e, vx, vz, yaw, v0 = f
                 sp = math.hypot(vx, vz)
@@ -286,15 +340,34 @@ if _HAVE_URSINA:
                 if nsp <= 0.06:                                 # friction won it → come to rest
                     self._pile.append([e, e.x, e.z, math.radians(e.rotation_y)])
                     self._slide.remove(f)
-                    self._cap_pile()
                     continue
                 vx *= nsp / sp; vz *= nsp / sp                  # apply friction to the velocity
                 e.position += Vec3(vx * dt, 0, vz * dt)
                 e.rotation_y += yaw * (nsp / v0) * dt           # spin fades with the slide
-                # bump off the tiles already resting in the centre
                 myaw = math.radians(e.rotation_y)
-                for p in self._pile:
+                # shove the resting discards: a solid hit hands momentum to the struck tile
+                # and re-launches it, so the pile spreads outward and the centre fills up
+                for p in self._pile[:]:
                     hit = _sat2d((p[1], p[2], p[3], hw, hh), (e.x, e.z, myaw, hw, hh))
+                    if hit is None:
+                        continue
+                    nx, nz, depth = hit                         # normal points struck-tile → slider
+                    e.x += nx * depth * 0.5; e.z += nz * depth * 0.5
+                    p[0].x = min(BOX_HALF, max(-BOX_HALF, p[0].x - nx * depth * 0.5))
+                    p[0].z = min(BOX_HALF, max(-BOX_HALF, p[0].z - nz * depth * 0.5))
+                    p[1], p[2] = p[0].x, p[0].z
+                    vn = vx * nx + vz * nz                      # slider's speed along the normal
+                    if vn < -0.3:                              # a real shove → transfer momentum
+                        T = 0.8                                 # fraction handed to the struck tile
+                        self._pile.remove(p)
+                        self._slide.append([p[0], vn * nx * T, vn * nz * T,
+                                            random.uniform(-160, 160), max(-vn * T, 0.1)])
+                        vx -= vn * nx * T; vz -= vn * nz * T    # slider keeps the remainder
+                        yaw += random.uniform(-80, 80)
+                    myaw = math.radians(e.rotation_y)
+                # static obstacles (hands + melds) only reflect the slider — they never move
+                for bx, bz, byaw, bhw, bhh in self.obstacles:
+                    hit = _sat2d((bx, bz, byaw, bhw, bhh), (e.x, e.z, myaw, hw, hh))
                     if hit is None:
                         continue
                     nx, nz, depth = hit
@@ -304,11 +377,25 @@ if _HAVE_URSINA:
                         vx -= 1.6 * vn * nx; vz -= 1.6 * vn * nz
                         yaw += random.uniform(-120, 120)
                     myaw = math.radians(e.rotation_y)
+                # invisible centre box: reflect anything leaving so discards never slide out
+                # under the exposed melds. Only outward motion bounces, so a tile thrown in
+                # from a seat edge still enters freely.
+                if (e.x > BOX_HALF and vx > 0) or (e.x < -BOX_HALF and vx < 0):
+                    e.x = math.copysign(BOX_HALF, e.x)
+                    vx = -vx * 0.5
+                    yaw += random.uniform(-120, 120)
+                if (e.z > BOX_HALF and vz > 0) or (e.z < -BOX_HALF and vz < 0):
+                    e.z = math.copysign(BOX_HALF, e.z)
+                    vz = -vz * 0.5
+                    yaw += random.uniform(-120, 120)
                 f[1], f[2], f[3] = vx, vz, yaw
 
-        def _cap_pile(self):
-            while len(self._pile) > self.max_pile:
-                destroy(self._pile.pop(0)[0])                   # retire the oldest discard
+        def clear(self):
+            """Destroy every in-flight + resting discard tile (e.g. between hands)."""
+            for lst in (self._slide, self._pile, self._arc):
+                for item in lst:
+                    destroy_tree(item[0])               # tiles have child meshes — free the whole subtree
+                lst.clear()
 
         # -- arc: tossed up + tumbling, lands face-up (kept for reference) ------------
         def _toss_arc(self):
@@ -338,29 +425,30 @@ if _HAVE_URSINA:
                     self._arc.remove(f)
 
 
+def setup_room():
+    """The dark room everything sits in: background, a wide dark floor, one overhead key
+    light + low fill (lit_with_shadows_shader reads this DirectionalLight), and an orbit
+    camera framing the table. Shared by the PoC and the live game."""
+    window.color = color.rgb32(6, 7, 12)             # dark room
+    Entity(model="plane", scale=(60, 1, 60), y=-0.31,
+           color=color.hsv(220, 0.25, 0.05), shader=_LIT)
+    AmbientLight(color=color.hsv(0, 0, 0.18))
+    sun = DirectionalLight()
+    sun.look_at(Vec3(0.45, -1.0, 0.55))
+    EditorCamera(rotation=(25, 0, 0))    # orbit with the mouse, scroll to zoom
+    camera.z = -31                       # pull back to frame the (now larger) table
+    camera.fov = 50
+    return sun
+
+
 def main():
     if not _HAVE_URSINA:
         sys.exit('Ursina is not installed — run:  pip install -e ".[threed]"')
 
     app = Ursina(title="crackedMahjong — Ursina 3D PoC")
-    window.color = color.rgb32(6, 7, 12)             # dark room
-
-    # a wide, very dark floor so the scene reads as a room rather than a void
-    Entity(model="plane", scale=(60, 1, 60), y=-0.31,
-           color=color.hsv(220, 0.25, 0.05), shader=_LIT)
+    setup_room()
     build_scene(reveal_all=False)                     # set True for the exposed view
-
-    # one overhead key light (angled so it shades + casts a shadow) + a low fill so the
-    # dark sides aren't pure black. lit_with_shadows_shader reads this DirectionalLight.
-    AmbientLight(color=color.hsv(0, 0, 0.18))
-    sun = DirectionalLight()
-    sun.look_at(Vec3(0.45, -1.0, 0.55))
-
     ThrowManager()                       # auto-tosses a tile into the centre periodically
-
-    EditorCamera(rotation=(30, 0, 0))    # orbit with the mouse, scroll to zoom
-    camera.z = -26                       # pull back to frame the (now larger) table
-    camera.fov = 50
     app.run()
 
 
