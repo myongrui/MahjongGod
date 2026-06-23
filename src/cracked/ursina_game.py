@@ -21,7 +21,7 @@ from collections import deque
 
 try:
     from ursina import (Ursina, Entity, Text, Button, color, camera, Vec3,
-                        time, application, window)
+                        time, application, window, mouse, BoxCollider)
     _HAVE_URSINA = True
 except Exception:                       # ursina not installed → module still imports
     _HAVE_URSINA = False
@@ -30,6 +30,7 @@ from cracked.engine import EventType
 from cracked.match import GameMatch
 from cracked.tiles import Wind, tile_name, bonus_tile_name
 from cracked import ursina_table as ut   # reuse: make_tile, setup_room, build_felt, ThrowManager, constants
+from cracked import ursina_room as ur     # reuse: setup_cabin (dark wood cabin + retro shader)
 
 WINDS = [int(Wind.EAST), int(Wind.SOUTH), int(Wind.WEST), int(Wind.NORTH)]
 _NAME = {int(Wind.EAST): "E", int(Wind.SOUTH): "S", int(Wind.WEST): "W", int(Wind.NORTH): "N"}
@@ -64,6 +65,8 @@ if _HAVE_URSINA:
             self.hud = Text(text="", origin=(-.5, .5), position=(-edge + 0.02, .47), scale=0.9, font="VeraMono.ttf")
             self.log = Text(text="", origin=(.5, .5), position=(edge - 0.02, 0.3), scale=0.7, font="VeraMono.ttf")
             self._log: deque = deque(maxlen=24)                 # rolling action log (oldest drops off top)
+            self.prompt = Text(text="", origin=(0, 0), y=-0.28, scale=1.3, color=color.yellow)
+            self._claim_btns: list = []                         # active claim buttons (interactive)
             self._start_hand()
 
         # -- seat geometry -------------------------------------------------------------
@@ -112,6 +115,8 @@ if _HAVE_URSINA:
             t = ut.make_tile(tid, reveal=reveal, parent=s["holder"],
                              bright=ut._pool(math.hypot(lx, ut.EDGE)))
             t.position = (lx, ut.TH / 2, ut.EDGE)
+            t.tid = tid                                          # for click-to-discard
+            t.base_y = ut.TH / 2                                 # rest height (hover lifts above this)
             s["tiles"].append(t)
 
         def _refresh_obstacles(self):
@@ -179,8 +184,9 @@ if _HAVE_URSINA:
         def update(self):
             if self.mode == "_done":
                 return
-            if self.mode == "interactive" and self.match.engine.awaiting_human_discard:
-                return                                               # wait for input (Phase B)
+            eng = self.match.engine
+            if self.mode == "interactive" and eng.awaiting_human_discard:
+                self._hover_tiles()                                  # lift the tile under the cursor
             if self._pause > 0:
                 self._pause -= time.dt
                 if self._pause <= 0:
@@ -190,15 +196,15 @@ if _HAVE_URSINA:
             if self._beat < BEAT:
                 return
             self._beat = 0.0
-            if not self.queue:
-                eng = self.match.engine
-                if eng.is_finished:
-                    self._pause = HAND_PAUSE
-                    return
-                self.queue.extend(eng.step())
-                if not self.queue:
-                    return
-            self._handle(self.queue.popleft())
+            if self.queue:                                           # drain queued events (animations + AWAIT_*)
+                self._handle(self.queue.popleft())
+                return
+            if self.mode == "interactive" and (eng.awaiting_human_discard or eng.awaiting_human_claim):
+                return                                               # waiting on the player's click
+            if eng.is_finished:
+                self._pause = HAND_PAUSE
+                return
+            self.queue.extend(eng.step())
 
         def _handle(self, ev):
             t = ev.type
@@ -233,7 +239,77 @@ if _HAVE_URSINA:
                 self._add_log("Wall exhausted — draw")
                 self._set_banner("Wall exhausted — draw")
                 self._pause = HAND_PAUSE
-            # DRAW logs nothing (routine); DEAL / AWAIT_DISCARD: nothing to do
+            elif t == EventType.AWAIT_DISCARD:
+                if self.mode == "interactive":
+                    self._begin_human_discard()
+            elif t == EventType.AWAIT_CLAIM:
+                if self.mode == "interactive":
+                    self._begin_human_claim(ev)
+            # DRAW logs nothing (routine); DEAL: nothing to do
+
+        # -- human input (interactive mode) --------------------------------------------
+        def _begin_human_discard(self):
+            self.prompt.text = "Your turn — click a tile to discard"
+            for t in self.seats[self._front_wind()]["tiles"]:
+                t.collider = BoxCollider(t, size=Vec3(ut.TW, ut.TH, ut.TD))
+                t.on_click = (lambda tid=t.tid: self._human_discard(tid))
+
+        def _disarm_tiles(self):
+            for t in self.seats[self._front_wind()]["tiles"]:
+                t.collider = None                                # stops further clicks/hover
+                t.y = t.base_y
+
+        def _hover_tiles(self):
+            hov = mouse.hovered_entity
+            for t in self.seats[self._front_wind()]["tiles"]:
+                t.y = t.base_y + (0.3 if t is hov else 0.0)
+
+        def _human_discard(self, tid):
+            eng = self.match.engine
+            if not eng.awaiting_human_discard:
+                return
+            self._disarm_tiles()
+            self.prompt.text = ""
+            self.queue.extend(eng.submit_discard(tid))
+
+        def _begin_human_claim(self, ev):
+            kinds = ev.detail["kinds"]
+            self.prompt.text = f"Claim {tile_name(ev.tile)}?"
+            opts = []
+            if "kong" in kinds:
+                opts.append(("Kong", lambda: self._human_claim("kong")))
+            if "pong" in kinds:
+                opts.append(("Pong", lambda: self._human_claim("pong")))
+            for combo in kinds.get("chow", []):
+                label = "Chow " + "".join(tile_name(t) for t in combo)
+                opts.append((label, lambda c=combo: self._human_claim("chow", c)))
+            opts.append(("Pass", self._human_pass))
+            n = len(opts)
+            for i, (label, cb) in enumerate(opts):
+                b = Button(parent=camera.ui, text=label, color=color.azure,
+                           scale=(0.16, 0.06), x=(i - (n - 1) / 2) * 0.18, y=-0.34)
+                b.on_click = cb
+                self._claim_btns.append(b)
+
+        def _clear_claim_btns(self):
+            for b in self._claim_btns:
+                ut.destroy_tree(b)
+            self._claim_btns = []
+            self.prompt.text = ""
+
+        def _human_claim(self, kind, chow=None):
+            eng = self.match.engine
+            if not eng.awaiting_human_claim:
+                return
+            self._clear_claim_btns()
+            self.queue.extend(eng.submit_claim(kind, chow))
+
+        def _human_pass(self):
+            eng = self.match.engine
+            if not eng.awaiting_human_claim:
+                return
+            self._clear_claim_btns()
+            self.queue.extend(eng.pass_claim())
 
         def _add_log(self, msg: str):
             self._log.append(msg)
@@ -242,7 +318,8 @@ if _HAVE_URSINA:
         # -- HUD -----------------------------------------------------------------------
         def _refresh_hud(self):
             e, m = self.match.engine, self.match
-            lines = [f"Table wind: {_FULL[m.table_wind]}",
+            lines = [f"{m.round_label}, hand {m.hand_number}",
+                     f"Table wind: {_FULL[m.table_wind]}",
                      f"Current seat: {_FULL[e.current_seat]}",
                      "", "Chips"]
             for w in WINDS:
@@ -261,20 +338,21 @@ if _HAVE_URSINA:
 
 
     class Menu(Entity):
-        """Title + Spectate / Play / Quit. Play is greyed until interactive mode lands."""
+        """Title + Play (you vs AI) / Spectate / Quit."""
 
         def __init__(self, on_start):
             super().__init__(parent=camera.ui)
             self.title = Text(parent=self, text="crackedMahjong — 3D",
                               origin=(0, 0), y=0.30, scale=2.2)
-            self.b_spec = Button(parent=self, text="Spectate (watch AI)", color=color.azure,
+            self.b_play = Button(parent=self, text="Play (you vs AI)", color=color.azure,
                                  scale=(0.42, 0.085), y=0.08)
-            self.b_play = Button(parent=self, text="Play — coming soon", color=color.gray,
+            self.b_spec = Button(parent=self, text="Spectate (watch AI)", color=color.azure,
                                  scale=(0.42, 0.085), y=-0.03)
             self.b_quit = Button(parent=self, text="Quit", color=color.dark_gray,
                                  scale=(0.42, 0.085), y=-0.14)
+            self.b_play.on_click = lambda: on_start("interactive")
             self.b_spec.on_click = lambda: on_start("spectator")
-            self.b_quit.on_click = application.quit                  # Play has no handler yet
+            self.b_quit.on_click = application.quit
 
         def hide(self):
             self.enabled = False
@@ -285,7 +363,7 @@ def main():
         sys.exit('Ursina is not installed — run:  pip install -e ".[threed]"')
 
     app = Ursina(title="crackedMahjong — 3D")
-    ut.setup_room()
+    ur.setup_cabin()                         # dark wood cabin + lights + camera + retro shader
     ut.build_felt()
     holder = {"menu": None, "driver": None}
 

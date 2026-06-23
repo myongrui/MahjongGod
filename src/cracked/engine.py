@@ -41,6 +41,7 @@ class EventType(Enum):
     WIN_DISCARD     = "win_discard"
     WALL_EXHAUSTED  = "wall_exhausted"
     AWAIT_DISCARD   = "await_discard"
+    AWAIT_CLAIM     = "await_claim"    # human may pong/kong/chow this discard
 
 
 @dataclass
@@ -102,6 +103,8 @@ class GameEngine:
         self.winner: Optional[int] = None
         self.kong_declared: bool = False
         self._awaiting_discard: bool = False
+        self._awaiting_claim: bool = False
+        self._pending_claim: Optional[dict] = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -122,6 +125,18 @@ class GameEngine:
     @property
     def awaiting_human_discard(self) -> bool:
         return self._awaiting_discard
+
+    @property
+    def awaiting_human_claim(self) -> bool:
+        return self._awaiting_claim
+
+    @property
+    def pending_claim_kinds(self) -> Optional[dict]:
+        """When awaiting a human claim, the available kinds: {'pong': True, 'kong': True,
+        'chow': [(t1,t2,t3), ...]} (only the keys that apply)."""
+        if not self._awaiting_claim or self._pending_claim is None:
+            return None
+        return self._pending_claim["dps"][self._pending_claim["index"]][1]
 
     # ------------------------------------------------------------------
     # Public API
@@ -156,6 +171,8 @@ class GameEngine:
         self._seat_idx = 0
         self.turn_number = 0
         self._awaiting_discard = False
+        self._awaiting_claim = False
+        self._pending_claim = None
         self.winner = None
         return [GameEvent(EventType.DEAL, seat=-1,
                           detail={"wall_remaining": self.wall_remaining})]
@@ -290,11 +307,12 @@ class GameEngine:
         if forced is not None:
             tid = forced
         else:
-            # Reached only after a claim, where the discarder is always an
-            # auto seat (humans never claim), so the policy returns a tile.
+            # Reached after a claim. AI seats return a tile; a human seat returns None,
+            # in which case we pause for their discard (e.g. after the human pongs/chows).
             choice = self.policies[seat].choose_discard(self.player_view_for(seat))
             if choice is None:
-                raise RuntimeError(f"policy for seat {seat} returned no discard")
+                self._awaiting_discard = True
+                return [GameEvent(EventType.AWAIT_DISCARD, seat=seat)]
             tid = choice
 
         player.hand.remove_tile(tid)
@@ -324,43 +342,101 @@ class GameEngine:
                                                 "shooter_pay": shooter_pay}))
                 return events
 
-        # Pong / kong / chow claims
-        claim_events = self._check_claims(tid, seat)
-        if claim_events:
-            events.extend(claim_events)
-            return events
-
-        self._seat_idx = (self._seat_idx + 1) % 4
+        # Pong / kong / chow claims (may pause for a human claimer)
+        events.extend(self._resolve_claims(tid, seat))
         return events
 
-    def _check_claims(self, discard_tid: int, discarder_seat: int) -> list[GameEvent]:
-        """Return claim events if any seat's policy wants to pong/kong/chow, else []."""
-        discarder_idx = _WIND_ORDER.index(discarder_seat)
-
-        # Pong / Kong: clockwise priority from discarder
+    def _claim_decision_points(self, tid: int, discarder_seat: int) -> list:
+        """Ordered claim opportunities in priority order: pong/kong (clockwise from the
+        discarder) before chow (left player only). Each point is [seat, kinds], where kinds
+        holds the claim types that seat may take here."""
+        di = _WIND_ORDER.index(discarder_seat)
+        dps = []
         for offset in range(1, 4):
-            claimer_seat = _WIND_ORDER[(discarder_idx + offset) % 4]
-            count = int(self.players[claimer_seat].hand.concealed[discard_tid])
-            if count < 2:
-                continue
-            view = self.player_view_for(claimer_seat)
-            policy = self.policies[claimer_seat]
-            if count >= 3 and policy.wants_kong(view, discard_tid):
-                return self._do_kong(claimer_seat, discarder_seat, discard_tid)
-            if policy.wants_pong(view, discard_tid):
-                return self._do_pong(claimer_seat, discarder_seat, discard_tid)
-
-        # Chow: left player only
-        left_seat = _WIND_ORDER[(discarder_idx + 1) % 4]
-        options = self._find_chow_options(self.players[left_seat].hand, discard_tid)
+            seat = _WIND_ORDER[(di + offset) % 4]
+            count = int(self.players[seat].hand.concealed[tid])
+            kinds: dict = {}
+            if count >= 3:
+                kinds["kong"] = True
+            if count >= 2:
+                kinds["pong"] = True
+            if kinds:
+                dps.append([seat, kinds])
+        left_seat = _WIND_ORDER[(di + 1) % 4]
+        options = self._find_chow_options(self.players[left_seat].hand, tid)
         if options:
-            chow = self.policies[left_seat].choose_chow(
-                self.player_view_for(left_seat), discard_tid, options
-            )
-            if chow:
-                return self._do_chow(left_seat, discarder_seat, discard_tid, chow)
+            dps.append([left_seat, {"chow": options}])
+        return dps
 
+    def _resolve_claims(self, tid: int, discarder_seat: int) -> list[GameEvent]:
+        """Begin claim resolution for a discard. Returns claim events, an AWAIT_CLAIM pause
+        (human's turn to decide), or [] after advancing the turn when nobody claims."""
+        self._pending_claim = {"tid": tid, "discarder": discarder_seat,
+                               "dps": self._claim_decision_points(tid, discarder_seat),
+                               "index": 0}
+        return self._advance_claims()
+
+    def _advance_claims(self) -> list[GameEvent]:
+        """Walk the pending claim opportunities in priority order. AI seats decide
+        immediately; a human seat pauses with an AWAIT_CLAIM event. When all decline, the
+        turn passes to the next player."""
+        pc = self._pending_claim
+        tid, discarder, dps = pc["tid"], pc["discarder"], pc["dps"]
+        i = pc["index"]
+        while i < len(dps):
+            seat, kinds = dps[i]
+            if seat in self._human_seats:
+                pc["index"] = i
+                self._awaiting_claim = True
+                return [GameEvent(EventType.AWAIT_CLAIM, seat=seat, tile=tid,
+                                  detail={"kinds": kinds})]
+            view = self.player_view_for(seat)
+            policy = self.policies[seat]
+            if "kong" in kinds and policy.wants_kong(view, tid):
+                return self._claim_done(self._do_kong(seat, discarder, tid))
+            if "pong" in kinds and policy.wants_pong(view, tid):
+                return self._claim_done(self._do_pong(seat, discarder, tid))
+            if "chow" in kinds:
+                chow = policy.choose_chow(view, tid, kinds["chow"])
+                if chow:
+                    return self._claim_done(self._do_chow(seat, discarder, tid, chow))
+            i += 1
+        # nobody claimed → next player's turn
+        self._pending_claim = None
+        self._awaiting_claim = False
+        self._seat_idx = (self._seat_idx + 1) % 4
         return []
+
+    def _claim_done(self, events: list[GameEvent]) -> list[GameEvent]:
+        self._pending_claim = None
+        self._awaiting_claim = False
+        return events
+
+    def submit_claim(self, kind: str, chow: Optional[tuple] = None) -> list[GameEvent]:
+        """Human takes the offered claim: kind in {'pong','kong','chow'} (chow needs the
+        chosen (t1,t2,t3) tuple). Returns the resulting events (then AWAIT_DISCARD)."""
+        if not self._awaiting_claim:
+            raise ValueError("Not awaiting a human claim")
+        pc = self._pending_claim
+        seat = pc["dps"][pc["index"]][0]
+        tid, discarder = pc["tid"], pc["discarder"]
+        self._pending_claim = None
+        self._awaiting_claim = False
+        if kind == "kong":
+            return self._do_kong(seat, discarder, tid)
+        if kind == "pong":
+            return self._do_pong(seat, discarder, tid)
+        if kind == "chow":
+            return self._do_chow(seat, discarder, tid, tuple(chow))
+        raise ValueError(f"unknown claim kind: {kind}")
+
+    def pass_claim(self) -> list[GameEvent]:
+        """Human declines the offered claim; resume with lower-priority claimers."""
+        if not self._awaiting_claim:
+            raise ValueError("Not awaiting a human claim")
+        self._awaiting_claim = False
+        self._pending_claim["index"] += 1
+        return self._advance_claims()
 
     # ------------------------------------------------------------------
     # Internal: claim option enumeration (decisions live in seat policies)
