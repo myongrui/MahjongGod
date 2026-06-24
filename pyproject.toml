@@ -36,6 +36,9 @@ cracked-ui = "cracked.tui:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+cracked = ["fonts/*.ttf"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["slow: full game simulations (run with -m slow)"]

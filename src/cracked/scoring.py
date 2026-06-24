@@ -18,6 +18,8 @@ from cracked.tiles import (
     SUITED_END, is_suited, is_honor, is_terminal, suit_of,
     Wind, Dragon, tile_name,
     SEAT_FLOWER, SEAT_SEASON, new_hand_array,
+    FLOWER_SPRING, FLOWER_WINTER, SEASON_PLUM, SEASON_BAMBOO_PLANT,
+    ANIMAL_CAT, ANIMAL_WORM,
 )
 from cracked.hand import HandState, Meld, MeldType
 
@@ -71,6 +73,9 @@ class WinContext:
     is_last_tile: bool = False      # 海底撈月
     is_replacement: bool = False    # 嶺上開花 (after kong draw)
     is_robbing_kong: bool = False   # 搶槓
+    is_heavenly: bool = False       # 天胡 (dealer wins on first draw)
+    is_earthly: bool = False        # 地胡 (non-dealer wins on dealer's first discard)
+    is_humanly: bool = False        # 人胡 (non-dealer wins on a first-round discard, pre-draw)
     prevailing_wind: int = Wind.EAST
 
 
@@ -182,6 +187,14 @@ def _meld_to_group(meld: Meld) -> _Group:
 
 def _is_limit_hand(hand: HandState, ctx: WinContext) -> Optional[str]:
     """Return a limit-hand name if detected, else None."""
+    # Timing limit hands take priority — they win regardless of hand pattern.
+    if ctx.is_heavenly:
+        return "Heavenly hand (天胡)"
+    if ctx.is_earthly:
+        return "Earthly hand (地胡)"
+    if ctx.is_humanly:
+        return "Humanly hand (人胡)"
+
     concealed = hand.concealed
     all_tiles = hand.concealed_tiles_list()
     exposed_tiles = [t for m in hand.melds for t in m.tiles]
@@ -195,6 +208,20 @@ def _is_limit_hand(hand: HandState, ctx: WinContext) -> Optional[str]:
     # All honors: every tile is wind or dragon
     if all(is_honor(t) for t in every_tile):
         return "All honors (字一色)"
+
+    # Pure terminals (清么九): every tile a suited terminal (1/9). Terminals can
+    # only form pongs, so any complete all-terminal hand qualifies.
+    if every_tile and all(is_suited(t) and is_terminal(t) for t in every_tile):
+        return "Pure terminals (清么九)"
+
+    # Nine gates (九连宝灯): concealed, single suit, 1112345678999 + one extra.
+    if not hand.melds and all(is_suited(t) for t in every_tile):
+        suits = {suit_of(t) for t in every_tile}
+        if len(suits) == 1:
+            base = suits.pop() * 9
+            counts = [int(concealed[base + r]) for r in range(9)]
+            if counts[0] >= 3 and counts[8] >= 3 and all(counts[r] >= 1 for r in range(1, 8)):
+                return "Nine gates (九连宝灯)"
 
     # Big three dragons: all three dragon types appear as pong/kong
     meld_groups = [_meld_to_group(m) for m in hand.melds]
@@ -230,6 +257,22 @@ def _is_limit_hand(hand: HandState, ctx: WinContext) -> Optional[str]:
 # Scoring a single decomposition
 # ---------------------------------------------------------------------------
 
+# Pure green tiles: bamboo 2,3,4,6,8 (indices 1,2,3,5,7) + green dragon.
+_GREEN_TILES = {1, 2, 3, 5, 7, int(Dragon.GREEN)}
+
+
+def _is_two_sided_chow_wait(group: _Group, winning_tile: int) -> bool:
+    """True if the winning tile completes this chow as a two-sided (ryanmen) wait.
+    Middle tile = closed (kanchan); a terminal-edge wait = edge (penchan)."""
+    low = group.tiles[0]
+    rank = low % 9                     # 0–8 within suit
+    if winning_tile == low:            # low end: held (low+1, low+2), waits low / low+3
+        return rank <= 5
+    if winning_tile == group.tiles[2]:  # high end: held (low, low+1), waits low-1 / low+2
+        return rank >= 1
+    return False                       # middle tile → closed wait
+
+
 def _score_decomp(
     decomp: _Decomposition,
     hand: HandState,
@@ -246,8 +289,10 @@ def _score_decomp(
     all_hand_tiles = all_grp_tiles + list(pair.tiles)
 
     # --- Win context ---
-    if ctx.is_self_draw:
-        bd.append(("Self-draw (自摸)", 1))
+    # Self-draw itself is a payout multiplier (handled in chip payment), not a tai.
+    # A fully-concealed self-draw, however, scores 門清.
+    if ctx.is_self_draw and all(m.concealed for m in hand.melds):
+        bd.append(("Fully concealed self-draw (門清)", 1))
     if ctx.is_last_tile:
         bd.append(("Last tile — 海底撈月", 1))
     if ctx.is_replacement:
@@ -263,9 +308,10 @@ def _score_decomp(
             dragon_pong_count += 1
     dragon_pair = DRAGON_START <= pair_tile < DRAGON_END
 
-    # Small three dragons (2 dragon pongs + dragon pair)
+    # Small three dragons (2 dragon pongs + dragon pair): +1 for the dragon pair.
+    # The two dragon pongs already score 1 each above, for a PDF total of 3.
     if dragon_pong_count == 2 and dragon_pair:
-        bd.append(("Small three dragons (小三元)", 3))
+        bd.append(("Small three dragons (小三元)", 1))
 
     # --- Wind pongs ---
     for g in groups:
@@ -304,7 +350,46 @@ def _score_decomp(
     )
     wind_pair = WIND_START <= pair_tile < WIND_END
     if wind_pong_count == 3 and wind_pair:
-        bd.append(("Small four winds (小四喜)", rules.tai_cap))
+        # +2 for the hand itself; seat/prevailing wind pongs score separately
+        # above, for a PDF total of 3–4.
+        bd.append(("Small four winds (小四喜)", 2))
+
+    all_triplets = all(g.is_triplet() for g in groups)
+
+    # --- Mixed terminals (混么九): all triplets of terminals/honors, mixed ---
+    # (Pure terminals — no honors — is a limit hand, handled earlier.)
+    if all_triplets and all(is_terminal(t) or is_honor(t) for t in all_hand_tiles):
+        if any(is_terminal(t) for t in all_hand_tiles) and any(is_honor(t) for t in all_hand_tiles):
+            bd.append(("Mixed terminals (混么九)", 2))  # +2 on top of All-Pongs → 4
+
+    # --- Pure green (绿一色): only green tiles, +2 on top of the flush → 4 ---
+    if all(t in _GREEN_TILES for t in all_hand_tiles):
+        bd.append(("Pure green (绿一色)", 2))
+
+    # --- Sequence hand (平胡) / lesser sequence hand (小平胡) ---
+    # All four groups are sequences and the pair is non-value (suited or a
+    # guest wind — not a dragon, seat, or prevailing wind).
+    if all(g.gtype == "chow" for g in groups) and not (
+        DRAGON_START <= pair_tile < DRAGON_END
+        or pair_tile == hand.seat_wind
+        or pair_tile == ctx.prevailing_wind
+    ):
+        has_bonus = bool(hand.flowers or hand.animals)
+        win_in_pair = ctx.winning_tile == pair_tile
+        two_sided = not win_in_pair and any(
+            g.gtype == "chow" and ctx.winning_tile in g.tiles
+            and _is_two_sided_chow_wait(g, ctx.winning_tile)
+            for g in groups
+        )
+        if has_bonus:
+            bd.append(("Lesser sequence hand (小平胡)", 1))
+        elif ctx.is_self_draw or two_sided:
+            bd.append(("Sequence hand (平胡)", 4))
+        # else: closed/edge wait on a discard, no bonus → no sequence-hand tai
+
+    # --- Hidden treasure (四暗刻/坎坎胡): four concealed triplets, self-drawn ---
+    if ctx.is_self_draw and all_triplets and all(g.concealed for g in groups):
+        bd.append(("Hidden treasure (四暗刻)", rules.tai_cap))
 
     total = sum(t for _, t in bd)
     return total, bd
@@ -325,8 +410,9 @@ def _score_seven_pairs(
     concealed = hand.concealed
     all_hand_tiles = hand.concealed_tiles_list()
 
+    # Seven pairs is always fully concealed, so a self-draw scores 門清.
     if ctx.is_self_draw:
-        bd.append(("Self-draw (自摸)", 1))
+        bd.append(("Fully concealed self-draw (門清)", 1))
     if ctx.is_last_tile:
         bd.append(("Last tile — 海底撈月", 1))
     if ctx.is_replacement:
@@ -392,8 +478,18 @@ def _score_bonus_tiles(hand: HandState) -> tuple[int, list[tuple[str, int]]]:
             bd.append(("Seat season", 1))
         # non-matching flower/season: 0 tai, not added
 
+    # Complete flower group (一台花): all 4 of one colour. +1 on top of the
+    # matching-tile point already counted above (PDF total 2 per colour).
+    if all(t in hand.flowers for t in range(FLOWER_SPRING, FLOWER_WINTER + 1)):
+        bd.append(("Complete flower group (一台花)", 1))
+    if all(t in hand.flowers for t in range(SEASON_PLUM, SEASON_BAMBOO_PLANT + 1)):
+        bd.append(("Complete season group (一台花)", 1))
+
     for _ in hand.animals:
         bd.append(("Animal", 1))
+    # All four animals: +1 on top of the four single points (PDF total 5).
+    if all(a in hand.animals for a in range(ANIMAL_CAT, ANIMAL_WORM + 1)):
+        bd.append(("All four animals", 1))
 
     bonus_tai = sum(t for _, t in bd)
     return bonus_tai, bd
@@ -419,15 +515,11 @@ def calculate_tai(
     if limit:
         flower_tai, flower_bd = _score_bonus_tiles(hand)
         base_bd: list[tuple[str, int]] = [(limit, rules.tai_cap)]
-        ctx_tai = 0
-        if ctx.is_self_draw:
-            ctx_tai += 1
-            base_bd.append(("Self-draw (自摸)", 1))
         if ctx.is_last_tile:
-            ctx_tai += 1
             base_bd.append(("Last tile — 海底撈月", 1))
-        base = min(rules.tai_cap + ctx_tai, rules.tai_cap)
-        total = base + flower_tai
+        # A limit hand is already at the cap; bonus tiles only push past it when
+        # flowers are scored above the cap.
+        total = rules.tai_cap + (flower_tai if rules.flowers_above_cap else 0)
         return TaiResult(total, base_bd + flower_bd, capped=True)
 
     # --- Seven pairs ---
@@ -456,13 +548,16 @@ def calculate_tai(
         best_base = seven_pairs_total
         best_bd = seven_pairs_bd
 
-    # --- Apply base tai cap ---
-    capped = best_base > rules.tai_cap
-    base_tai = min(best_base, rules.tai_cap)
-
-    # --- Flowers added on top of cap ---
+    # --- Bonus tiles (flowers / seasons / animals) ---
     flower_tai, flower_bd = _score_bonus_tiles(hand)
-    total = base_tai + (flower_tai if rules.flowers_above_cap else 0)
+
+    # --- Apply tai cap ---
+    if rules.flowers_above_cap:
+        total = min(best_base, rules.tai_cap) + flower_tai
+        capped = best_base > rules.tai_cap
+    else:
+        total = min(best_base + flower_tai, rules.tai_cap)
+        capped = best_base + flower_tai > rules.tai_cap
 
     return TaiResult(
         total=total,

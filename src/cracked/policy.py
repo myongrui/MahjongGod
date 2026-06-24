@@ -21,6 +21,7 @@ from typing import Optional, Protocol
 import numpy as np
 
 from cracked.tiles import NTILES
+from cracked.hand import MeldType
 from cracked.game_state import GameState
 from cracked.tiles_away import tiles_away
 from cracked.optimizer import recommend_discard
@@ -51,6 +52,11 @@ class Policy(Protocol):
     ) -> Optional[tuple[int, int, int]]:
         ...
 
+    def choose_self_kong(self, view: GameState) -> Optional[int]:
+        """Tile to kong on this turn — a concealed 4-of-a-kind or promoting an
+        exposed pong to a kong — or None to skip."""
+        ...
+
 
 class HumanPolicy:
     """Human seat: discard comes from external input; never auto-claims."""
@@ -67,6 +73,9 @@ class HumanPolicy:
     def choose_chow(
         self, view: GameState, tile: int, options: list[tuple[int, int, int]]
     ) -> Optional[tuple[int, int, int]]:
+        return None
+
+    def choose_self_kong(self, view: GameState) -> Optional[int]:
         return None
 
 
@@ -140,3 +149,26 @@ class HeuristicPolicy:
                 best_s = min_s
                 best_option = chow_tiles
         return best_option
+
+    def choose_self_kong(self, view: GameState) -> Optional[int]:
+        concealed = view.my_hand.concealed
+        n_melds = len(view.my_hand.melds)
+        # Promote an exposed pong to a kong when holding its 4th tile — always free.
+        for m in view.my_hand.melds:
+            if m.type == MeldType.PONG and concealed[m.tiles[0]] >= 1:
+                return int(m.tiles[0])
+        current_s = tiles_away(concealed, n_melds)
+        if current_s == -1:
+            return None  # already waiting/complete — don't disturb the hand
+        # Concealed kong of a 4-of-a-kind, if it doesn't set back tiles_away.
+        for tid in range(NTILES):
+            if concealed[tid] == 4:
+                test = concealed.copy()
+                test[tid] -= 4
+                s = min(
+                    (tiles_away(test - _EYE[t], n_melds + 1) for t in range(NTILES) if test[t] > 0),
+                    default=current_s,
+                )
+                if s <= current_s:
+                    return tid
+        return None

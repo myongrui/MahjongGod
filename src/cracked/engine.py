@@ -23,7 +23,7 @@ from cracked.tiles import NTILES, Wind, tile_name, is_bonus_tile, is_animal
 from cracked.hand import HandState, Meld, MeldType
 from cracked.game_state import GameState, PlayerView
 from cracked.tiles_away import tiles_away
-from cracked.scoring import calculate_tai, WinContext, chip_payment, STARTING_CHIPS
+from cracked.scoring import calculate_tai, WinContext, chip_payment, STARTING_CHIPS, DEFAULT_RULES
 from cracked.optimizer import recommend_discard, DiscardRecommendation
 from cracked.policy import Policy, HumanPolicy, HeuristicPolicy
 
@@ -42,6 +42,7 @@ class EventType(Enum):
     WALL_EXHAUSTED  = "wall_exhausted"
     AWAIT_DISCARD   = "await_discard"
     AWAIT_CLAIM     = "await_claim"    # human may pong/kong/chow this discard
+    AWAIT_WIN       = "await_win"      # human may declare a win (hu) or decline
 
 
 @dataclass
@@ -105,6 +106,11 @@ class GameEngine:
         self._awaiting_discard: bool = False
         self._awaiting_claim: bool = False
         self._pending_claim: Optional[dict] = None
+        self._awaiting_win: bool = False
+        self._pending_win: Optional[dict] = None
+        # Sacred/missed-discard prohibition: tiles each seat may not win/pong from a
+        # discard until their next turn (回头牌 / 过水牌). Cleared at the seat's turn.
+        self._prohibited: dict[int, set[int]] = {w: set() for w in _WIND_ORDER}
 
     # ------------------------------------------------------------------
     # Properties
@@ -129,6 +135,10 @@ class GameEngine:
     @property
     def awaiting_human_claim(self) -> bool:
         return self._awaiting_claim
+
+    @property
+    def awaiting_human_win(self) -> bool:
+        return self._awaiting_win
 
     @property
     def pending_claim_kinds(self) -> Optional[dict]:
@@ -173,6 +183,9 @@ class GameEngine:
         self._awaiting_discard = False
         self._awaiting_claim = False
         self._pending_claim = None
+        self._awaiting_win = False
+        self._pending_win = None
+        self._prohibited = {w: set() for w in _WIND_ORDER}
         self.winner = None
         return [GameEvent(EventType.DEAL, seat=-1,
                           detail={"wall_remaining": self.wall_remaining})]
@@ -190,8 +203,11 @@ class GameEngine:
             return []
         if self._awaiting_discard:
             return [GameEvent(EventType.AWAIT_DISCARD, seat=self.current_seat)]
+        if self._awaiting_win or self._awaiting_claim:
+            return []                       # blocked on a pending human hu / claim decision
 
         seat = self.current_seat
+        self._prohibited[seat].clear()      # a new turn lifts this seat's sacred/missed bans
         player = self.players[seat]
         events: list[GameEvent] = []
 
@@ -200,24 +216,27 @@ class GameEngine:
         if exhausted:
             self._phase = "finished"
             return events
+        if self.is_finished:                      # eight-flower instant win during draw
+            return events
 
         drawn = next(e.tile for e in reversed(draw_events) if e.type == EventType.DRAW)
 
         if tiles_away(player.hand.concealed, len(player.hand.melds)) == -1:
-            ctx = WinContext(winning_tile=drawn, is_self_draw=True,
-                             is_last_tile=self.wall_remaining <= 15)
-            tai_result = calculate_tai(player.hand, ctx)
-            if tai_result.is_valid_win():
-                _, zimo_pay = chip_payment(tai_result.total)
-                for other in _WIND_ORDER:
-                    if other != seat:
-                        self.chips[other] -= zimo_pay
-                        self.chips[seat] += zimo_pay
-                self._phase = "finished"
-                self.winner = seat
-                events.append(GameEvent(EventType.WIN_SELF_DRAW, seat=seat, tile=drawn,
-                                        detail={"tai": tai_result.total, "zimo_pay": zimo_pay}))
+            ctx = self._self_draw_ctx(seat, drawn)
+            if calculate_tai(player.hand, ctx).is_valid_win():
+                if seat in self._human_seats:               # let the human choose hu / decline
+                    self._awaiting_win = True
+                    self._pending_win = {"kind": "self_draw", "seat": seat, "tid": drawn}
+                    events.append(GameEvent(EventType.AWAIT_WIN, seat=seat, tile=drawn,
+                                            detail={"self_draw": True}))
+                    return events
+                events.extend(self._declare_self_draw_win(seat, drawn))
                 return events
+
+        # Own-turn kongs (concealed / promotion) before discarding.
+        events.extend(self._offer_self_kongs(seat))
+        if self.is_finished:
+            return events
 
         choice = self.policies[seat].choose_discard(self.player_view_for(seat))
         if choice is None:
@@ -237,6 +256,66 @@ class GameEngine:
             raise ValueError(f"{tile_name(tile_id)} is not in your hand")
         self._awaiting_discard = False
         return self._execute_discard(seat, forced=tile_id)
+
+    def _self_draw_ctx(self, seat: int, drawn: int) -> WinContext:
+        is_heavenly = (seat == int(Wind.EAST) and self.turn_number == 1
+                       and all(not p.discards for p in self.players.values())
+                       and self._no_melds_anywhere())
+        return WinContext(winning_tile=drawn, is_self_draw=True,
+                          is_last_tile=self.wall_remaining <= 15,
+                          is_heavenly=is_heavenly, prevailing_wind=self.prevailing_wind)
+
+    def _declare_self_draw_win(self, seat: int, drawn: int) -> list[GameEvent]:
+        """Settle a self-draw win: score, everyone pays, finish the hand."""
+        tai_result = calculate_tai(self.players[seat].hand, self._self_draw_ctx(seat, drawn))
+        _, zimo_pay = chip_payment(tai_result.total)
+        for other in _WIND_ORDER:
+            if other != seat:
+                self.chips[other] -= zimo_pay
+                self.chips[seat] += zimo_pay
+        self._phase = "finished"
+        self.winner = seat
+        return [GameEvent(EventType.WIN_SELF_DRAW, seat=seat, tile=drawn,
+                          detail={"tai": tai_result.total, "zimo_pay": zimo_pay})]
+
+    def submit_win(self) -> list[GameEvent]:
+        """Human declares the offered win (hu)."""
+        if not self._awaiting_win:
+            raise ValueError("Not awaiting a human win")
+        pw = self._pending_win
+        self._awaiting_win = False
+        self._pending_win = None
+        if pw["kind"] == "ron":
+            return self._declare_discard_win(pw["seat"], pw["discarder"], pw["tid"])
+        return self._declare_self_draw_win(pw["seat"], pw["tid"])
+
+    def decline_win(self) -> list[GameEvent]:
+        """Human declines the offered win and play continues."""
+        if not self._awaiting_win:
+            raise ValueError("Not awaiting a human win")
+        pw = self._pending_win
+        self._awaiting_win = False
+        self._pending_win = None
+        if pw["kind"] == "ron":
+            self._prohibited[pw["seat"]].add(pw["tid"])   # 过水牌: passed up a winning tile
+            # Check lower-priority ron winners, then fall through to claims.
+            win_events, stop = self._resolve_discard_win(pw["tid"], pw["discarder"],
+                                                         start_offset=pw["offset"] + 1)
+            if stop:
+                return win_events
+            return win_events + self._resolve_claims(pw["tid"], pw["discarder"])
+        # Declined a self-draw: continue the turn (kongs, then discard).
+        seat = pw["seat"]
+        events = self._offer_self_kongs(seat)
+        if self.is_finished:
+            return events
+        choice = self.policies[seat].choose_discard(self.player_view_for(seat))
+        if choice is None:
+            self._awaiting_discard = True
+            events.append(GameEvent(EventType.AWAIT_DISCARD, seat=seat))
+            return events
+        events.extend(self._execute_discard(seat, forced=choice))
+        return events
 
     def get_recommendations(self) -> list[DiscardRecommendation]:
         """Run the heuristic optimizer from the human player's perspective."""
@@ -262,6 +341,41 @@ class GameEngine:
         )
 
     # ------------------------------------------------------------------
+    # Internal: timing-hand detection (天胡 / 地胡 / 人胡)
+    # ------------------------------------------------------------------
+
+    def _no_melds_anywhere(self) -> bool:
+        return all(not p.hand.melds for p in self.players.values())
+
+    def _eight_flower_win(self, seat: int) -> GameEvent:
+        """Resolve a 花胡 (eight-flower) instant limit win as a self-draw."""
+        _, zimo_pay = chip_payment(DEFAULT_RULES.tai_cap)
+        for other in _WIND_ORDER:
+            if other != seat:
+                self.chips[other] -= zimo_pay
+                self.chips[seat] += zimo_pay
+        self._phase = "finished"
+        self.winner = seat
+        return GameEvent(EventType.WIN_SELF_DRAW, seat=seat, tile=-1,
+                         detail={"tai": DEFAULT_RULES.tai_cap, "zimo_pay": zimo_pay,
+                                 "eight_flowers": True})
+
+    def _discard_win_timing(self, discarder: int, claimer: int) -> tuple[bool, bool]:
+        """(is_earthly, is_humanly) for a discard win, per the first-round rules."""
+        if not self._no_melds_anywhere():
+            return False, False
+        total_discards = sum(len(p.discards) for p in self.players.values())
+        east = int(Wind.EAST)
+        # Earthly: a non-dealer wins on the dealer's very first discard.
+        is_earthly = (discarder == east and total_discards == 1 and self.turn_number == 1)
+        # Humanly: a non-dealer wins on a first-round discard before their own
+        # first draw (approximated by: claimer has not discarded yet, round 1).
+        is_humanly = (not is_earthly and claimer != east
+                      and not self.players[claimer].discards
+                      and self.turn_number <= 4)
+        return is_earthly, is_humanly
+
+    # ------------------------------------------------------------------
     # Internal: drawing
     # ------------------------------------------------------------------
 
@@ -284,6 +398,10 @@ class GameEngine:
                     player.hand.flowers.append(tid)
                 events.append(GameEvent(EventType.BONUS, seat=seat, tile=tid,
                                         detail={"wall_remaining": self.wall_remaining}))
+                # Two complete flower groups (花胡): 8 flowers/seasons = instant limit win.
+                if not is_animal(tid) and len(player.hand.flowers) == 8:
+                    events.append(self._eight_flower_win(seat))
+                    return events, False
                 continue  # draw replacement from live wall only
 
             player.hand.add_tile(tid)
@@ -317,34 +435,73 @@ class GameEngine:
 
         player.hand.remove_tile(tid)
         player.discards.append(tid)
+        self._prohibited[seat].add(tid)     # 回头牌: can't win/pong this until your next turn
         events.append(GameEvent(EventType.DISCARD, seat=seat, tile=tid))
 
-        # Discard-win check
-        for claimer_seat in _WIND_ORDER:
-            if claimer_seat == seat:
-                continue
-            claimer = self.players[claimer_seat]
-            claimer.hand.concealed[tid] += 1
-            tai_result = None
-            if tiles_away(claimer.hand.concealed, len(claimer.hand.melds)) == -1:
-                ctx = WinContext(winning_tile=tid, is_self_draw=False,
-                                 is_last_tile=self.wall_remaining <= 15)
-                tai_result = calculate_tai(claimer.hand, ctx)
-            claimer.hand.concealed[tid] -= 1
-            if tai_result is not None and tai_result.is_valid_win():
-                shooter_pay, _ = chip_payment(tai_result.total)
-                self.chips[seat] -= shooter_pay
-                self.chips[claimer_seat] += shooter_pay
-                self._phase = "finished"
-                self.winner = claimer_seat
-                events.append(GameEvent(EventType.WIN_DISCARD, seat=claimer_seat, tile=tid,
-                                        detail={"shooter": seat, "tai": tai_result.total,
-                                                "shooter_pay": shooter_pay}))
-                return events
+        # Discard-win check (head-bump priority). Pauses if a human may declare hu.
+        win_events, stop = self._resolve_discard_win(tid, seat)
+        events.extend(win_events)
+        if stop:
+            return events
 
         # Pong / kong / chow claims (may pause for a human claimer)
         events.extend(self._resolve_claims(tid, seat))
         return events
+
+    def _can_ron(self, claimer_seat: int, discarder_seat: int, tid: int) -> bool:
+        """True if claimer_seat has a valid winning hand on the discard tid."""
+        if tid in self._prohibited[claimer_seat]:    # 回头牌 / 过水牌: barred this go-around
+            return False
+        claimer = self.players[claimer_seat]
+        claimer.hand.concealed[tid] += 1
+        valid = False
+        if tiles_away(claimer.hand.concealed, len(claimer.hand.melds)) == -1:
+            is_earthly, is_humanly = self._discard_win_timing(discarder_seat, claimer_seat)
+            ctx = WinContext(winning_tile=tid, is_self_draw=False,
+                             is_last_tile=self.wall_remaining <= 15,
+                             is_earthly=is_earthly, is_humanly=is_humanly,
+                             prevailing_wind=self.prevailing_wind)
+            valid = calculate_tai(claimer.hand, ctx).is_valid_win()
+        claimer.hand.concealed[tid] -= 1
+        return valid
+
+    def _declare_discard_win(self, claimer_seat: int, discarder_seat: int, tid: int) -> list[GameEvent]:
+        """Settle a ron: score, pay the shooter, finish the hand."""
+        claimer = self.players[claimer_seat]
+        claimer.hand.concealed[tid] += 1
+        is_earthly, is_humanly = self._discard_win_timing(discarder_seat, claimer_seat)
+        ctx = WinContext(winning_tile=tid, is_self_draw=False,
+                         is_last_tile=self.wall_remaining <= 15,
+                         is_earthly=is_earthly, is_humanly=is_humanly,
+                         prevailing_wind=self.prevailing_wind)
+        tai_result = calculate_tai(claimer.hand, ctx)
+        claimer.hand.concealed[tid] -= 1
+        shooter_pay, _ = chip_payment(tai_result.total)
+        self.chips[discarder_seat] -= shooter_pay
+        self.chips[claimer_seat] += shooter_pay
+        self._phase = "finished"
+        self.winner = claimer_seat
+        return [GameEvent(EventType.WIN_DISCARD, seat=claimer_seat, tile=tid,
+                          detail={"shooter": discarder_seat, "tai": tai_result.total,
+                                  "shooter_pay": shooter_pay})]
+
+    def _resolve_discard_win(self, tid: int, discarder_seat: int,
+                             start_offset: int = 1) -> tuple[list[GameEvent], bool]:
+        """Walk potential ron winners in head-bump order. Returns (events, stop):
+        stop=True when a win is declared OR we pause for a human's hu decision."""
+        di = _WIND_ORDER.index(discarder_seat)
+        for offset in range(start_offset, 4):
+            claimer_seat = _WIND_ORDER[(di + offset) % 4]
+            if not self._can_ron(claimer_seat, discarder_seat, tid):
+                continue
+            if claimer_seat in self._human_seats:
+                self._awaiting_win = True
+                self._pending_win = {"kind": "ron", "tid": tid, "seat": claimer_seat,
+                                     "discarder": discarder_seat, "offset": offset}
+                return [GameEvent(EventType.AWAIT_WIN, seat=claimer_seat, tile=tid,
+                                  detail={"from": discarder_seat})], True
+            return self._declare_discard_win(claimer_seat, discarder_seat, tid), True
+        return [], False
 
     def _claim_decision_points(self, tid: int, discarder_seat: int) -> list:
         """Ordered claim opportunities in priority order: pong/kong (clockwise from the
@@ -354,6 +511,8 @@ class GameEngine:
         dps = []
         for offset in range(1, 4):
             seat = _WIND_ORDER[(di + offset) % 4]
+            if tid in self._prohibited[seat]:        # 回头牌 / 过水牌: no pong/kong of a barred tile
+                continue
             count = int(self.players[seat].hand.concealed[tid])
             kinds: dict = {}
             if count >= 3:
@@ -400,6 +559,8 @@ class GameEngine:
                 chow = policy.choose_chow(view, tid, kinds["chow"])
                 if chow:
                     return self._claim_done(self._do_chow(seat, discarder, tid, chow))
+            if "pong" in kinds or "kong" in kinds:
+                self._prohibited[seat].add(tid)      # 过水牌: passed a pong/kong opportunity
             i += 1
         # nobody claimed → next player's turn
         self._pending_claim = None
@@ -408,8 +569,12 @@ class GameEngine:
         return []
 
     def _claim_done(self, events: list[GameEvent]) -> list[GameEvent]:
-        self._pending_claim = None
-        self._awaiting_claim = False
+        # The claim's own discard (inside _do_pong/_kong/_chow) already resolved its
+        # state — either advancing the turn or pausing for a NESTED human claim/discard/
+        # win. Only finalize the original claim here when nothing new is pending; never
+        # clobber a fresh pause (which would orphan the human's prompt and let play run on).
+        if not (self._awaiting_claim or self._awaiting_discard or self._awaiting_win):
+            self._pending_claim = None
         return events
 
     def submit_claim(self, kind: str, chow: Optional[tuple] = None) -> list[GameEvent]:
@@ -435,7 +600,11 @@ class GameEngine:
         if not self._awaiting_claim:
             raise ValueError("Not awaiting a human claim")
         self._awaiting_claim = False
-        self._pending_claim["index"] += 1
+        pc = self._pending_claim
+        seat, kinds = pc["dps"][pc["index"]]
+        if "pong" in kinds or "kong" in kinds:
+            self._prohibited[seat].add(pc["tid"])    # 过水牌: passed a pong/kong opportunity
+        pc["index"] += 1
         return self._advance_claims()
 
     # ------------------------------------------------------------------
@@ -475,8 +644,38 @@ class GameEngine:
         events.extend(self._execute_discard(claimer_seat))
         return events
 
-    def _do_kong(self, claimer_seat: int, discarder_seat: int, tile: int) -> list[GameEvent]:
+    def _kong_replacement(self, seat: int) -> tuple[list[GameEvent], bool]:
+        """Draw a kong replacement tile and resolve any 嶺上開花 self-draw win.
+        Returns (events, hand_over). hand_over is True if the hand ended here."""
         self.kong_declared = True
+        events, exhausted = self._draw_tile(seat)
+        if exhausted:
+            self._phase = "finished"
+            return events, True
+        if self.is_finished:                      # eight-flower during replacement draw
+            return events, True
+        player = self.players[seat]
+        if tiles_away(player.hand.concealed, len(player.hand.melds)) == -1:
+            drawn = next(e.tile for e in reversed(events) if e.type == EventType.DRAW)
+            ctx = WinContext(winning_tile=drawn, is_self_draw=True, is_replacement=True,
+                             is_last_tile=self.wall_remaining <= 15,
+                             prevailing_wind=self.prevailing_wind)
+            tai_result = calculate_tai(player.hand, ctx)
+            if tai_result.is_valid_win():
+                _, zimo_pay = chip_payment(tai_result.total)
+                for other in _WIND_ORDER:
+                    if other != seat:
+                        self.chips[other] -= zimo_pay
+                        self.chips[seat] += zimo_pay
+                self._phase = "finished"
+                self.winner = seat
+                events.append(GameEvent(EventType.WIN_SELF_DRAW, seat=seat, tile=drawn,
+                                        detail={"tai": tai_result.total, "zimo_pay": zimo_pay,
+                                                "replacement": True}))
+                return events, True
+        return events, False
+
+    def _do_kong(self, claimer_seat: int, discarder_seat: int, tile: int) -> list[GameEvent]:
         claimer = self.players[claimer_seat]
         claimer.hand.concealed[tile] -= 3
         claimer.hand.melds.append(
@@ -487,32 +686,98 @@ class GameEngine:
         events = [GameEvent(EventType.MELD, seat=claimer_seat, tile=tile,
                             detail={"meld_type": "kong", "from": discarder_seat,
                                     "tiles": [tile, tile, tile, tile]})]
-
-        draw_events, exhausted = self._draw_tile(claimer_seat)
-        events.extend(draw_events)
-        if exhausted:
-            self._phase = "finished"
+        replacement, over = self._kong_replacement(claimer_seat)
+        events.extend(replacement)
+        if over:
             return events
-
-        if tiles_away(claimer.hand.concealed, len(claimer.hand.melds)) == -1:
-            drawn = next(e.tile for e in reversed(draw_events) if e.type == EventType.DRAW)
-            ctx = WinContext(winning_tile=drawn, is_self_draw=True, is_replacement=True,
-                             is_last_tile=self.wall_remaining <= 15)
-            tai_result = calculate_tai(claimer.hand, ctx)
-            if tai_result.is_valid_win():
-                _, zimo_pay = chip_payment(tai_result.total)
-                for other in _WIND_ORDER:
-                    if other != claimer_seat:
-                        self.chips[other] -= zimo_pay
-                        self.chips[claimer_seat] += zimo_pay
-                self._phase = "finished"
-                self.winner = claimer_seat
-                events.append(GameEvent(EventType.WIN_SELF_DRAW, seat=claimer_seat, tile=drawn,
-                                        detail={"tai": tai_result.total, "zimo_pay": zimo_pay}))
-                return events
-
+        events.extend(self._offer_self_kongs(claimer_seat))
+        if self.is_finished or self._awaiting_discard:
+            return events
         events.extend(self._execute_discard(claimer_seat))
         return events
+
+    # ------------------------------------------------------------------
+    # Internal: own-turn kongs (concealed 暗杠 / promoted 加杠) + robbing (搶槓)
+    # ------------------------------------------------------------------
+
+    def _offer_self_kongs(self, seat: int) -> list[GameEvent]:
+        """Let `seat` declare concealed/promoted kong(s) before discarding. Each
+        kong draws a replacement (可 嶺上開花); a promotion may be robbed (搶槓)."""
+        events: list[GameEvent] = []
+        chooser = getattr(self.policies[seat], "choose_self_kong", None)
+        while chooser is not None:
+            tid = chooser(self.player_view_for(seat))
+            if tid is None:
+                break
+            player = self.players[seat]
+            promotion = any(m.type == MeldType.PONG and m.tiles[0] == tid for m in player.hand.melds)
+            if promotion:
+                robbed = self._check_robbing_kong(seat, tid)
+                if robbed is not None:
+                    events.extend(robbed)
+                    return events                 # hand ended — kong was robbed
+                events.extend(self._do_promoted_kong(seat, tid))
+            elif player.hand.concealed[tid] >= 4:
+                events.extend(self._do_concealed_kong(seat, tid))
+            else:
+                break
+            if self.is_finished:                  # 嶺上開花 on the replacement draw
+                return events
+        return events
+
+    def _do_concealed_kong(self, seat: int, tid: int) -> list[GameEvent]:
+        player = self.players[seat]
+        player.hand.concealed[tid] -= 4
+        player.hand.melds.append(
+            Meld(MeldType.KONG, (tid, tid, tid, tid), concealed=True, source_player=None)
+        )
+        events = [GameEvent(EventType.MELD, seat=seat, tile=tid,
+                            detail={"meld_type": "kong", "concealed": True,
+                                    "tiles": [tid, tid, tid, tid]})]
+        replacement, _ = self._kong_replacement(seat)
+        events.extend(replacement)
+        return events
+
+    def _do_promoted_kong(self, seat: int, tid: int) -> list[GameEvent]:
+        player = self.players[seat]
+        for i, m in enumerate(player.hand.melds):
+            if m.type == MeldType.PONG and m.tiles[0] == tid:
+                player.hand.melds[i] = Meld(MeldType.KONG, (tid, tid, tid, tid),
+                                            concealed=False, source_player=m.source_player)
+                break
+        player.hand.concealed[tid] -= 1
+        events = [GameEvent(EventType.MELD, seat=seat, tile=tid,
+                            detail={"meld_type": "kong", "promoted": True,
+                                    "tiles": [tid, tid, tid, tid]})]
+        replacement, _ = self._kong_replacement(seat)
+        events.extend(replacement)
+        return events
+
+    def _check_robbing_kong(self, kong_seat: int, tid: int) -> Optional[list[GameEvent]]:
+        """If another player can win on the tile being promoted (加杠), they rob it
+        (搶槓). Returns the win events (hand finished) or None. Head-bump priority."""
+        di = _WIND_ORDER.index(kong_seat)
+        for offset in range(1, 4):
+            claimer_seat = _WIND_ORDER[(di + offset) % 4]
+            claimer = self.players[claimer_seat]
+            claimer.hand.concealed[tid] += 1
+            tai_result = None
+            if tiles_away(claimer.hand.concealed, len(claimer.hand.melds)) == -1:
+                ctx = WinContext(winning_tile=tid, is_self_draw=False, is_robbing_kong=True,
+                                 is_last_tile=self.wall_remaining <= 15,
+                                 prevailing_wind=self.prevailing_wind)
+                tai_result = calculate_tai(claimer.hand, ctx)
+            claimer.hand.concealed[tid] -= 1
+            if tai_result is not None and tai_result.is_valid_win():
+                shooter_pay, _ = chip_payment(tai_result.total)
+                self.chips[kong_seat] -= shooter_pay
+                self.chips[claimer_seat] += shooter_pay
+                self._phase = "finished"
+                self.winner = claimer_seat
+                return [GameEvent(EventType.WIN_DISCARD, seat=claimer_seat, tile=tid,
+                                  detail={"shooter": kong_seat, "tai": tai_result.total,
+                                          "shooter_pay": shooter_pay, "robbing_kong": True})]
+        return None
 
     def _do_chow(self, claimer_seat: int, discarder_seat: int, tile: int,
                  chow_tiles: tuple[int, int, int]) -> list[GameEvent]:

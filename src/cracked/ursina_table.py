@@ -39,6 +39,7 @@ except Exception:
 from cracked.engine import GameEngine
 from cracked.tiles import Wind
 from cracked.tui_tiles import make_face, FW, FH
+from cracked import ursina_audio as ua
 
 # tile size + table layout, in Ursina world units
 TW, TH, TD = 0.5, 0.72, 0.38            # tile width / height / thickness
@@ -276,6 +277,7 @@ if _HAVE_URSINA:
             self._pile: list = []          # resting discards: [entity, x, z, yaw_rad]
             self._arc: list = []           # [entity, velocity, angular_velocity]
             self.obstacles: list = []      # extra static boxes (cx, cz, yaw, hw, hh) to collide with
+            self._clack_cd = 0.0           # cooldown so colliding tiles don't machine-gun the sound
 
         def update(self):
             if self.auto:
@@ -283,9 +285,17 @@ if _HAVE_URSINA:
                 if self._t >= 1.6:
                     self._t = 0.0
                     (self._toss_slide if self.mode == "slide" else self._toss_arc)()
+            if self._clack_cd > 0:
+                self._clack_cd -= time.dt
             self._advance_slide()
             self._relax_pile()
             self._advance_arc()
+
+        def _clack(self):
+            """Play a collision knock, rate-limited so a settling pile doesn't overlap dozens."""
+            if self._clack_cd <= 0:
+                ua.play("collide")
+                self._clack_cd = 0.05
 
         def throw(self, tid, start, target=None):
             """Slide tile `tid` flat from world `start` into the centre (or `target`),
@@ -300,6 +310,7 @@ if _HAVE_URSINA:
             speed = math.sqrt(2 * SLIDE_A * dist) * 1.15        # a little extra for bounces
             yaw = random.uniform(160, 320) * random.choice((-1, 1))
             self._slide.append([e, dx / dist * speed, dz / dist * speed, yaw, speed])
+            ua.play("throw")
             return e
 
         # -- slide: flat across the felt, spinning, colliding with the pile (active) ---
@@ -358,6 +369,7 @@ if _HAVE_URSINA:
                     p[1], p[2] = p[0].x, p[0].z
                     vn = vx * nx + vz * nz                      # slider's speed along the normal
                     if vn < -0.3:                              # a real shove → transfer momentum
+                        self._clack()                          # knock of tile-on-tile
                         T = 0.8                                 # fraction handed to the struck tile
                         self._pile.remove(p)
                         self._slide.append([p[0], vn * nx * T, vn * nz * T,
@@ -373,6 +385,8 @@ if _HAVE_URSINA:
                     nx, nz, depth = hit
                     e.x += nx * depth; e.z += nz * depth        # push out of the overlap
                     vn = vx * nx + vz * nz
+                    if vn < -0.3:                               # a firm hit on a hand/meld → knock
+                        self._clack()
                     if vn < 0:                                  # moving in → reflect (e≈0.6)
                         vx -= 1.6 * vn * nx; vz -= 1.6 * vn * nz
                         yaw += random.uniform(-120, 120)
@@ -396,6 +410,16 @@ if _HAVE_URSINA:
                 for item in lst:
                     destroy_tree(item[0])               # tiles have child meshes — free the whole subtree
                 lst.clear()
+
+        def remove(self, entity):
+            """Take one discard tile off the table (it was claimed into a meld)."""
+            if entity is None:
+                return
+            for lst in (self._slide, self._pile, self._arc):
+                for item in lst[:]:
+                    if item[0] is entity:
+                        lst.remove(item)
+            destroy_tree(entity)
 
         # -- arc: tossed up + tumbling, lands face-up (kept for reference) ------------
         def _toss_arc(self):
@@ -446,6 +470,7 @@ def main():
         sys.exit('Ursina is not installed — run:  pip install -e ".[threed]"')
 
     app = Ursina(title="crackedMahjong — Ursina 3D PoC")
+    ua.init()
     setup_room()
     build_scene(reveal_all=False)                     # set True for the exposed view
     ThrowManager()                       # auto-tosses a tile into the centre periodically
